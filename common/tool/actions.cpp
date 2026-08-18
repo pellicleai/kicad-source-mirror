@@ -1331,6 +1331,14 @@ TOOL_ACTION ACTIONS::showProperties( TOOL_ACTION_ARGS()
         .ToolbarState( TOOLBAR_STATE::TOGGLE )
         .Icon( BITMAPS::tools ) );
 
+TOOL_ACTION ACTIONS::showAiAssistant( TOOL_ACTION_ARGS()
+        .Name( "common.Control.showAiAssistant" )
+        .Scope( AS_GLOBAL )
+        .FriendlyName( _( "AI Assistant" ) )
+        .Tooltip( _( "Show/hide the AI Assistant panel" ) )
+        .ToolbarState( TOOLBAR_STATE::TOGGLE )
+        .Icon( BITMAPS::help ) );
+
 TOOL_ACTION ACTIONS::showDatasheet( TOOL_ACTION_ARGS()
         .Name( "common.Control.showDatasheet" )
         .Scope( AS_GLOBAL )

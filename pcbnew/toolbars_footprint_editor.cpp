@@ -90,7 +90,8 @@ std::optional<TOOLBAR_CONFIGURATION> FOOTPRINT_EDIT_TOOLBAR_SETTINGS::DefaultToo
         config.AppendSeparator()
               .AppendAction( ACTIONS::showLibraryTree )
               .AppendAction( PCB_ACTIONS::showLayersManager )
-              .AppendAction( ACTIONS::showProperties );
+              .AppendAction( ACTIONS::showProperties )
+              .AppendAction( ACTIONS::showAiAssistant );
         break;
 
     case TOOLBAR_LOC::RIGHT:

@@ -199,6 +199,8 @@ public:
 
     void ToggleLayersManager();
 
+    void ToggleAiAssistant() override;
+
     /**
      * Save a library to a new name and/or library type.
      *

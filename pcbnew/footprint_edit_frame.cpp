@@ -88,6 +88,7 @@
 #include <widgets/pcb_properties_panel.h>
 #include <wildcards_and_files_ext.h>
 #include <widgets/wx_aui_utils.h>
+#include <widgets/ai_assistant_panel.h>
 #include <toolbars_footprint_editor.h>
 
 #include <algorithm>
@@ -192,6 +193,7 @@ FOOTPRINT_EDIT_FRAME::FOOTPRINT_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     m_selectionFilterPanel = new PANEL_SELECTION_FILTER( this );
     m_appearancePanel = new APPEARANCE_CONTROLS( this, GetCanvas(), true );
     m_propertiesPanel = new PCB_PROPERTIES_PANEL( this, this );
+    m_aiAssistantPanel = new AI_ASSISTANT_PANEL( this );
 
     // LoadSettings() *after* creating m_LayersManager, because LoadSettings() initialize
     // parameters in m_LayersManager
@@ -254,6 +256,18 @@ FOOTPRINT_EDIT_FRAME::FOOTPRINT_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
                       .Left().Layer( 3 )
                       .Caption( _( "Properties" ) ).PaneBorder( false )
                       .MinSize( FromDIP( wxSize( 240, 60 ) ) ).BestSize( FromDIP( wxSize( 300, 200 ) ) ) );
+
+    m_auimgr.AddPane( m_aiAssistantPanel, EDA_PANE().Name( AiAssistantPaneName() )
+                      .Right().Layer( 3 )
+                      .Caption( _( "AI Assistant" ) ).PaneBorder( true )
+                      .TopDockable( false )
+                      .BottomDockable( false )
+                      .MinSize( FromDIP( wxSize( 300, 200 ) ) )
+                      .BestSize( FromDIP( wxSize( 380, 400 ) ) )
+                      .FloatingSize( FromDIP( wxSize( 400, 600 ) ) )
+                      .CloseButton( true )
+                      .Show( false ) );
+
     m_auimgr.AddPane( m_tbLeft, EDA_PANE().VToolbar().Name( "LeftToolbar" )
                       .Left().Layer( 2 ) );
 
@@ -498,6 +512,22 @@ void FOOTPRINT_EDIT_FRAME::ToggleLibraryTree()
         m_editorSettings->m_LibWidth = m_treePane->GetSize().x;
         m_auimgr.Update();
     }
+}
+
+
+void FOOTPRINT_EDIT_FRAME::ToggleAiAssistant()
+{
+    if( !m_aiAssistantPanel )
+        return;
+
+    wxAuiPaneInfo& aiPane = m_auimgr.GetPane( AiAssistantPaneName() );
+    bool show = !aiPane.IsShown();
+    aiPane.Show( show );
+
+    if( show )
+        SetAuiPaneSize( m_auimgr, aiPane, 380, -1 );
+    else
+        m_auimgr.Update();
 }
 
 
@@ -2310,6 +2340,12 @@ void FOOTPRINT_EDIT_FRAME::setupUIConditions()
                 return m_auimgr.GetPane( PropertiesPaneName() ).IsShown();
             };
 
+    auto aiAssistantCond =
+            [this] ( const SELECTION& )
+            {
+                return m_auimgr.GetPane( AiAssistantPaneName() ).IsShown();
+            };
+
     mgr->SetConditions( ACTIONS::highContrastMode,          CHECK( highContrastCond ) );
     mgr->SetConditions( PCB_ACTIONS::flipBoard,             CHECK( boardFlippedCond ) );
     mgr->SetConditions( ACTIONS::toggleBoundingBoxes,       CHECK( cond.BoundingBoxes() ) );
@@ -2317,6 +2353,7 @@ void FOOTPRINT_EDIT_FRAME::setupUIConditions()
     mgr->SetConditions( ACTIONS::showLibraryTree,           CHECK( libraryTreeCond ) );
     mgr->SetConditions( PCB_ACTIONS::showLayersManager,     CHECK( layerManagerCond ) );
     mgr->SetConditions( ACTIONS::showProperties,            CHECK( propertiesCond ) );
+    mgr->SetConditions( ACTIONS::showAiAssistant,           CHECK( aiAssistantCond ) );
 
     mgr->SetConditions( ACTIONS::print,                     ENABLE( haveFootprintCond ) );
     mgr->SetConditions( PCB_ACTIONS::exportFootprint,       ENABLE( haveFootprintCond ) );

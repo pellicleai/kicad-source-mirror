@@ -677,6 +677,15 @@ int SYMBOL_EDITOR_CONTROL::ToggleProperties( const TOOL_EVENT& aEvent )
 }
 
 
+int SYMBOL_EDITOR_CONTROL::ToggleAiAssistant( const TOOL_EVENT& aEvent )
+{
+    if( m_frame->IsType( FRAME_SCH_SYMBOL_EDITOR ) )
+        getEditFrame<SYMBOL_EDIT_FRAME>()->ToggleAiAssistant();
+
+    return 0;
+}
+
+
 int SYMBOL_EDITOR_CONTROL::ShowElectricalTypes( const TOOL_EVENT& aEvent )
 {
     SCH_RENDER_SETTINGS* renderSettings = m_frame->GetRenderSettings();
@@ -1249,6 +1258,7 @@ void SYMBOL_EDITOR_CONTROL::setTransitions()
     Go( &SYMBOL_EDITOR_CONTROL::ToggleSyncedPinsMode,  SCH_ACTIONS::toggleSyncedPinsMode.MakeEvent() );
 
     Go( &SYMBOL_EDITOR_CONTROL::ToggleProperties,      ACTIONS::showProperties.MakeEvent() );
+    Go( &SYMBOL_EDITOR_CONTROL::ToggleAiAssistant,     ACTIONS::showAiAssistant.MakeEvent() );
     Go( &SYMBOL_EDITOR_CONTROL::ToggleHiddenPins,      SCH_ACTIONS::showHiddenPins.MakeEvent() );
     Go( &SYMBOL_EDITOR_CONTROL::ToggleHiddenFields,    SCH_ACTIONS::showHiddenFields.MakeEvent() );
     Go( &SYMBOL_EDITOR_CONTROL::TogglePinAltIcons,     SCH_ACTIONS::togglePinAltIcons.MakeEvent() );

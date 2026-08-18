@@ -199,7 +199,8 @@ std::optional<TOOLBAR_CONFIGURATION> PCB_EDIT_TOOLBAR_SETTINGS::DefaultToolbarCo
         // Tools to show/hide toolbars:
         config.AppendSeparator()
               .AppendAction( PCB_ACTIONS::showLayersManager )
-              .AppendAction( ACTIONS::showProperties );
+              .AppendAction( ACTIONS::showProperties )
+              .AppendAction( ACTIONS::showAiAssistant );
 
         break;
 

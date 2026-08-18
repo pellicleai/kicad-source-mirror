@@ -85,7 +85,8 @@ std::optional<TOOLBAR_CONFIGURATION> SYMBOL_EDIT_TOOLBAR_SETTINGS::DefaultToolba
 
         config.AppendSeparator()
               .AppendAction( ACTIONS::showLibraryTree )
-              .AppendAction( ACTIONS::showProperties );
+              .AppendAction( ACTIONS::showProperties )
+              .AppendAction( ACTIONS::showAiAssistant );
         break;
 
     case TOOLBAR_LOC::RIGHT:
@@ -210,5 +211,4 @@ void SYMBOL_EDIT_FRAME::ClearToolbarControl( int aId )
     case ID_LIBEDIT_SELECT_BODY_STYLE:  m_bodyStyleSelectBox = nullptr; break;
     }
 }
-
 

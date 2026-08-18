@@ -123,6 +123,7 @@ void SYMBOL_EDIT_FRAME::doReCreateMenuBar()
     ACTION_MENU* showHidePanels = new ACTION_MENU( false, selTool );
     showHidePanels->SetTitle( _( "Panels" ) );
     showHidePanels->Add( ACTIONS::showProperties,  ACTION_MENU::CHECK );
+    showHidePanels->Add( ACTIONS::showAiAssistant, ACTION_MENU::CHECK );
     showHidePanels->Add( ACTIONS::showLibraryTree, ACTION_MENU::CHECK );
     viewMenu->Add( showHidePanels );
     viewMenu->AppendSeparator();

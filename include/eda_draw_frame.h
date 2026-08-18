@@ -48,6 +48,7 @@ class SEARCH_PANE;
 class HOTKEY_CYCLE_POPUP;
 class PROPERTIES_PANEL;
 class NET_INSPECTOR_PANEL;
+class AI_ASSISTANT_PANEL;
 enum class BITMAP_TYPE;
 class FILEDLG_HOOK_NEW_LIBRARY;
 
@@ -421,6 +422,10 @@ public:
 
     static const wxString PropertiesPaneName() { return wxS( "PropertiesManager" ); }
 
+    static const wxString AiAssistantPaneName() { return wxS( "AiAssistant" ); }
+
+    virtual void ToggleAiAssistant() {}
+
     static const wxString NetInspectorPanelName() { return wxS( "NetInspector" ); }
 
     static const wxString DesignBlocksPaneName() { return wxS( "DesignBlocks" ); }
@@ -603,6 +608,7 @@ protected:
     SEARCH_PANE*         m_searchPane;
     PROPERTIES_PANEL*    m_propertiesPanel;
     NET_INSPECTOR_PANEL* m_netInspectorPanel;
+    AI_ASSISTANT_PANEL*  m_aiAssistantPanel = nullptr;
 
     HOTKEY_CYCLE_POPUP* m_hotkeyPopup;
 

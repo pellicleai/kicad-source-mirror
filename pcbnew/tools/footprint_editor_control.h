@@ -68,6 +68,7 @@ public:
 
     int ToggleLayersManager( const TOOL_EVENT& aEvent );
     int ToggleProperties( const TOOL_EVENT& aEvent );
+    int ToggleAiAssistant( const TOOL_EVENT& aEvent );
     int Properties( const TOOL_EVENT& aEvent );
     void editFootprintPropertiesFromLibrary( const LIB_ID& aLibId );
 

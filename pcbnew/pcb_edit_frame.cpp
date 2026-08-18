@@ -144,6 +144,7 @@
 #include <widgets/pcb_properties_panel.h>
 #include <widgets/pcb_net_inspector_panel.h>
 #include <widgets/wx_aui_utils.h>
+#include <widgets/ai_assistant_panel.h>
 #include <kiplatform/app.h>
 #include <kiplatform/ui.h>
 #include <core/profile.h>
@@ -308,6 +309,7 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     m_netInspectorPanel = new PCB_NET_INSPECTOR_PANEL( this, this );
     m_designBlocksPane = new PCB_DESIGN_BLOCK_PANE( this, nullptr, m_designBlockHistoryList );
     m_constraintsPanel = new PANEL_CONSTRAINTS( this );
+    m_aiAssistantPanel = new AI_ASSISTANT_PANEL( this );
 
     m_auimgr.SetManagedWindow( this );
 
@@ -392,6 +394,17 @@ PCB_EDIT_FRAME::PCB_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
                       .BestSize( FromDIP( wxSize( 300, 200 ) ) )
                       .FloatingSize( wxSize( 300, 200 ) )
                       .CloseButton( true ) );
+
+    m_auimgr.AddPane( m_aiAssistantPanel, EDA_PANE().Name( AiAssistantPaneName() )
+                      .Right().Layer( 3 )
+                      .Caption( _( "AI Assistant" ) ).PaneBorder( true )
+                      .TopDockable( false )
+                      .BottomDockable( false )
+                      .MinSize( FromDIP( wxSize( 300, 200 ) ) )
+                      .BestSize( FromDIP( wxSize( 380, 400 ) ) )
+                      .FloatingSize( FromDIP( wxSize( 400, 600 ) ) )
+                      .CloseButton( true )
+                      .Show( false ) );
 
     // Center
     m_auimgr.AddPane( GetCanvas(), EDA_PANE().Canvas().Name( wxS( "DrawFrame" ) )
@@ -838,6 +851,26 @@ void PCB_EDIT_FRAME::ToggleConstraintsPanel()
 }
 
 
+void PCB_EDIT_FRAME::ToggleAiAssistant()
+{
+    if( !m_aiAssistantPanel )
+        return;
+
+    wxAuiPaneInfo& aiPane = m_auimgr.GetPane( AiAssistantPaneName() );
+    bool show = !aiPane.IsShown();
+    aiPane.Show( show );
+
+    if( show )
+    {
+        SetAuiPaneSize( m_auimgr, aiPane, 380, -1 );
+    }
+    else
+    {
+        m_auimgr.Update();
+    }
+}
+
+
 void PCB_EDIT_FRAME::detachTextVarTracker()
 {
     if( GetCanvas() )
@@ -1231,6 +1264,12 @@ void PCB_EDIT_FRAME::setupUIConditions()
                 return PropertiesShown();
             };
 
+    auto aiAssistantCond =
+            [this] ( const SELECTION& )
+            {
+                return m_auimgr.GetPane( AiAssistantPaneName() ).IsShown();
+            };
+
     auto netInspectorCond =
             [this] ( const SELECTION& )
             {
@@ -1308,6 +1347,7 @@ void PCB_EDIT_FRAME::setupUIConditions()
     mgr->SetConditions( PCB_ACTIONS::toggleNetHighlight,   CHECK( netHighlightCond )
                                                            .Enable( enableNetHighlightCond ) );
     mgr->SetConditions( ACTIONS::showProperties,           CHECK( propertiesCond ) );
+    mgr->SetConditions( ACTIONS::showAiAssistant,          CHECK( aiAssistantCond ) );
     mgr->SetConditions( PCB_ACTIONS::showNetInspector,     CHECK( netInspectorCond ) );
     mgr->SetConditions( PCB_ACTIONS::showSearch,           CHECK( searchPaneCond ) );
     mgr->SetConditions( PCB_ACTIONS::showConstraintsPanel, CHECK( constraintsPaneCond ) );

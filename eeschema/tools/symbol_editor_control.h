@@ -62,6 +62,7 @@ public:
     int ShowElectricalTypes( const TOOL_EVENT& aEvent );
     int ShowPinNumbers( const TOOL_EVENT& aEvent );
     int ToggleProperties( const TOOL_EVENT& aEvent );
+    int ToggleAiAssistant( const TOOL_EVENT& aEvent );
     int ToggleSyncedPinsMode( const TOOL_EVENT& aEvent );
 
     int ToggleHiddenPins( const TOOL_EVENT& aEvent );

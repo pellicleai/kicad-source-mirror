@@ -231,6 +231,8 @@ public:
 
     void ToggleProperties() override;
 
+    void ToggleAiAssistant() override;
+
     void ToggleLibraryTree() override;
     bool IsLibraryTreeShown() const override;
     void FocusLibraryTreeInput() override;

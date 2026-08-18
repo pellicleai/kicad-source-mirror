@@ -115,6 +115,7 @@
 #include <wx/debug.h>
 #include <widgets/panel_sch_selection_filter.h>
 #include <widgets/wx_aui_utils.h>
+#include <widgets/ai_assistant_panel.h>
 #include <drawing_sheet/ds_proxy_view_item.h>
 #include <project/project_local_settings.h>
 #include <toolbars_sch_editor.h>
@@ -233,6 +234,8 @@ SCH_EDIT_FRAME::SCH_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     m_selectionFilterPanel = new PANEL_SCH_SELECTION_FILTER( this );
     m_designBlocksPane = new SCH_DESIGN_BLOCK_PANE( this, nullptr, m_designBlockHistoryList );
 
+    m_aiAssistantPanel = new AI_ASSISTANT_PANEL( this );
+
     m_auimgr.SetManagedWindow( this );
 
     CreateInfoBar();
@@ -264,6 +267,19 @@ SCH_EDIT_FRAME::SCH_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
 
     m_auimgr.AddPane( m_propertiesPanel, defaultPropertiesPaneInfo( this ) );
     m_auimgr.AddPane( m_selectionFilterPanel, defaultSchSelectionFilterPaneInfo( this ) );
+
+    m_auimgr.AddPane( m_aiAssistantPanel, EDA_PANE().Name( AiAssistantPaneName() )
+                      .Right().Layer( 3 )
+                      .Caption( _( "AI Assistant" ) )
+                      .CaptionVisible( true )
+                      .PaneBorder( true )
+                      .TopDockable( false )
+                      .BottomDockable( false )
+                      .CloseButton( true )
+                      .MinSize( FromDIP( wxSize( 300, 200 ) ) )
+                      .BestSize( FromDIP( wxSize( 380, 400 ) ) )
+                      .FloatingSize( FromDIP( wxSize( 400, 600 ) ) )
+                      .Show( false ) );
 
     m_auimgr.AddPane( m_designBlocksPane, defaultDesignBlocksPaneInfo( this ) );
     m_auimgr.AddPane( m_remoteSymbolPane, defaultRemoteSymbolPaneInfo( this ) );
@@ -781,6 +797,12 @@ void SCH_EDIT_FRAME::setupUIConditions()
                 return m_auimgr.GetPane( RemoteSymbolPaneName() ).IsShown();
             };
 
+    auto aiAssistantCond =
+            [this] ( const SELECTION& )
+            {
+                return m_auimgr.GetPane( AiAssistantPaneName() ).IsShown();
+            };
+
     auto undoCond =
             [ this ] (const SELECTION& aSel )
             {
@@ -815,6 +837,7 @@ void SCH_EDIT_FRAME::setupUIConditions()
     mgr->SetConditions( SCH_ACTIONS::showHierarchy,        CHECK( hierarchyNavigatorCond ) );
     mgr->SetConditions( SCH_ACTIONS::showNetNavigator,     CHECK( netNavigatorCond ) );
     mgr->SetConditions( ACTIONS::showProperties,           CHECK( propertiesCond ) );
+    mgr->SetConditions( ACTIONS::showAiAssistant,          CHECK( aiAssistantCond ) );
     mgr->SetConditions( SCH_ACTIONS::showDesignBlockPanel, CHECK( designBlockCond ) );
     mgr->SetConditions( SCH_ACTIONS::showRemoteSymbolPanel, CHECK( remoteSymbolCond ) );
     mgr->SetConditions( ACTIONS::toggleGrid,               CHECK( cond.GridVisible() ) );
@@ -2100,6 +2123,7 @@ void SCH_EDIT_FRAME::ShowChangedLanguage()
     m_auimgr.GetPane( m_hierarchy ).Caption( _( "Schematic Hierarchy" ) );
     m_auimgr.GetPane( m_selectionFilterPanel ).Caption( _( "Selection Filter" ) );
     m_auimgr.GetPane( m_propertiesPanel ).Caption( _( "Properties" ) );
+    m_auimgr.GetPane( m_aiAssistantPanel ).Caption( _( "AI Assistant" ) );
     m_auimgr.GetPane( m_designBlocksPane ).Caption( _( "Design Blocks" ) );
     m_auimgr.GetPane( RemoteSymbolPaneName() ).Caption( _( "Remote Symbols" ) );
     m_auimgr.Update();
@@ -2961,6 +2985,27 @@ void SCH_EDIT_FRAME::ToggleProperties()
     else
     {
         settings->m_AuiPanels.properties_panel_width = m_propertiesPanel->GetSize().x;
+        m_auimgr.Update();
+    }
+}
+
+
+void SCH_EDIT_FRAME::ToggleAiAssistant()
+{
+    if( !m_aiAssistantPanel )
+        return;
+
+    wxAuiPaneInfo& aiPane = m_auimgr.GetPane( AiAssistantPaneName() );
+    bool show = !aiPane.IsShown();
+    aiPane.Show( show );
+
+    if( show )
+    {
+        int width = 380;
+        SetAuiPaneSize( m_auimgr, aiPane, width, -1 );
+    }
+    else
+    {
         m_auimgr.Update();
     }
 }

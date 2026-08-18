@@ -81,6 +81,7 @@
 #include <widgets/lib_tree.h>
 #include <widgets/symbol_tree_pane.h>
 #include <widgets/wx_aui_utils.h>
+#include <widgets/ai_assistant_panel.h>
 #include <widgets/filedlg_hook_new_library.h>
 #include <wildcards_and_files_ext.h>
 #include <panel_sym_lib_table.h>
@@ -192,6 +193,8 @@ SYMBOL_EDIT_FRAME::SYMBOL_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
 
     m_selectionFilterPanel = new PANEL_SCH_SELECTION_FILTER( this );
 
+    m_aiAssistantPanel = new AI_ASSISTANT_PANEL( this );
+
     m_auimgr.SetManagedWindow( this );
 
     CreateInfoBar();
@@ -255,6 +258,19 @@ SYMBOL_EDIT_FRAME::SYMBOL_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
 
     m_auimgr.AddPane( m_propertiesPanel, defaultPropertiesPaneInfo( this ) );
     m_auimgr.AddPane( m_selectionFilterPanel, defaultSchSelectionFilterPaneInfo( this ) );
+
+    m_auimgr.AddPane( m_aiAssistantPanel, EDA_PANE().Name( AiAssistantPaneName() )
+                      .Right().Layer( 3 )
+                      .Caption( _( "AI Assistant" ) )
+                      .CaptionVisible( true )
+                      .PaneBorder( true )
+                      .TopDockable( false )
+                      .BottomDockable( false )
+                      .CloseButton( true )
+                      .MinSize( FromDIP( wxSize( 300, 200 ) ) )
+                      .BestSize( FromDIP( wxSize( 380, 400 ) ) )
+                      .FloatingSize( FromDIP( wxSize( 400, 600 ) ) )
+                      .Show( false ) );
 
     // Can be called only when all panes are created, because (at least on Windows) when items
     // managed by m_auimgr are not the same as those existing when saved by Perspective()
@@ -661,10 +677,17 @@ void SYMBOL_EDIT_FRAME::setupUIConditions()
                 return m_auimgr.GetPane( PropertiesPaneName() ).IsShown();
             };
 
+    auto aiAssistantCond =
+            [this] ( const SELECTION& )
+            {
+                return m_auimgr.GetPane( AiAssistantPaneName() ).IsShown();
+            };
+
     mgr->SetConditions( SCH_ACTIONS::showElectricalTypes, CHECK( pinTypeCond ) );
     mgr->SetConditions( ACTIONS::toggleBoundingBoxes,     CHECK( cond.BoundingBoxes() ) );
     mgr->SetConditions( ACTIONS::showLibraryTree,         CHECK( showLibraryTreeCond ) );
     mgr->SetConditions( ACTIONS::showProperties,          CHECK( propertiesCond ) );
+    mgr->SetConditions( ACTIONS::showAiAssistant,          CHECK( aiAssistantCond ) );
     mgr->SetConditions( SCH_ACTIONS::showHiddenPins,      CHECK( hiddenPinCond ) );
     mgr->SetConditions( SCH_ACTIONS::showHiddenFields,    CHECK( hiddenFieldCond ) );
     mgr->SetConditions( SCH_ACTIONS::togglePinAltIcons,   CHECK( showPinAltIconsCond ) );
@@ -878,6 +901,22 @@ void SYMBOL_EDIT_FRAME::ToggleProperties()
 
     m_auimgr.Update();
     Refresh();
+}
+
+
+void SYMBOL_EDIT_FRAME::ToggleAiAssistant()
+{
+    if( !m_aiAssistantPanel )
+        return;
+
+    wxAuiPaneInfo& aiPane = m_auimgr.GetPane( AiAssistantPaneName() );
+    bool show = !aiPane.IsShown();
+    aiPane.Show( show );
+
+    if( show )
+        SetAuiPaneSize( m_auimgr, aiPane, 380, -1 );
+    else
+        m_auimgr.Update();
 }
 
 

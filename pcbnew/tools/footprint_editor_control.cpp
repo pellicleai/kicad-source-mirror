@@ -895,6 +895,13 @@ int FOOTPRINT_EDITOR_CONTROL::ToggleProperties( const TOOL_EVENT& aEvent )
 }
 
 
+int FOOTPRINT_EDITOR_CONTROL::ToggleAiAssistant( const TOOL_EVENT& aEvent )
+{
+    m_frame->ToggleAiAssistant();
+    return 0;
+}
+
+
 int FOOTPRINT_EDITOR_CONTROL::Properties( const TOOL_EVENT& aEvent )
 {
     // Check if called from tree context menu
@@ -1193,6 +1200,7 @@ void FOOTPRINT_EDITOR_CONTROL::setTransitions()
     Go( &FOOTPRINT_EDITOR_CONTROL::DefaultPadProperties, PCB_ACTIONS::defaultPadProperties.MakeEvent() );
     Go( &FOOTPRINT_EDITOR_CONTROL::ToggleLayersManager,  PCB_ACTIONS::showLayersManager.MakeEvent() );
     Go( &FOOTPRINT_EDITOR_CONTROL::ToggleProperties,     ACTIONS::showProperties.MakeEvent() );
+    Go( &FOOTPRINT_EDITOR_CONTROL::ToggleAiAssistant,    ACTIONS::showAiAssistant.MakeEvent() );
     // clang-format on
 
     // Line modes for the footprint editor: explicit modes, next-mode, and toolbar sync

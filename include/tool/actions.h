@@ -261,6 +261,7 @@ public:
     static TOOL_ACTION updateSchematicFromPcb;
     static TOOL_ACTION showProperties;
     static TOOL_ACTION showDatasheet;
+    static TOOL_ACTION showAiAssistant;
 
     // Internal
     static TOOL_ACTION updateMenu;

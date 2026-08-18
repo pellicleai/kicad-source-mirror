@@ -128,6 +128,9 @@ public:
     /// Show/hide the dockable geometric-constraint list pane, refreshing it when shown (#2329).
     void ToggleConstraintsPanel();
 
+    /// Show/hide the AI Assistant panel.
+    void ToggleAiAssistant() override;
+
     /// The dockable geometric-constraint list pane (#2329), or nullptr.
     PANEL_CONSTRAINTS* GetConstraintsPanel() const { return m_constraintsPanel; }
 
@@ -853,6 +856,7 @@ private:
     PCB_DESIGN_BLOCK_PANE* m_designBlocksPane;
     // Tool Reset() reads this before the ctor creates the panel.
     PANEL_CONSTRAINTS* m_constraintsPanel = nullptr; ///< Dockable geometric-constraint list (#2329).
+
 
     /// Secondary infobar that stacks above the main one; reserved for load-time
     /// notices (currently the WRL -> STEP migration prompt) that must not be
