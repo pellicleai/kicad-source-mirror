@@ -20,17 +20,14 @@
 #include <widgets/ai_assistant_panel.h>
 #include <wx/log.h>
 #include <wx/translation.h>
+#include <wx/socket.h>
+#include <wx/sckaddr.h>
 
-// Default backend URL. When non-empty, the panel will attempt to load from
-// this URL. When empty (or unreachable), the built-in HTML page is used.
+// Default backend URL.
 static const wxString DEFAULT_BACKEND_URL = wxS( "http://localhost:3000" );
 
 // ---------------------------------------------------------------------------
-// Built-in HTML chat UI
-//
-// This is rendered when no backend server is available. It provides a
-// minimal but functional chat interface so the sidebar is never blank.
-// When a backend is running, call LoadFromURL() to switch to the full UI.
+// Built-in HTML chat UI (shown when no backend is running)
 // ---------------------------------------------------------------------------
 static const wxString BUILTIN_CHAT_HTML = wxString::FromUTF8(
 R"HTML(<!DOCTYPE html>
@@ -165,12 +162,10 @@ R"HTML(<!DOCTYPE html>
   </div>
   <div id="status">Backend: not connected (localhost:3000)</div>
   <script>
-    // The input is disabled until a backend is connected.
-    // When a backend is available, it will call:
-    //   window.kicadAi.enable()
-    // to activate the input and start receiving messages.
     window.kicadAi = {
       enabled: false,
+      requestCounter: 0,
+      pendingRequests: {},
       enable: function() {
         window.kicadAi.enabled = true;
         document.getElementById('msg-input').disabled = false;
@@ -189,9 +184,39 @@ R"HTML(<!DOCTYPE html>
       },
       clearMessages: function() {
         document.getElementById('messages').innerHTML = '';
+      },
+      // Send a tool call to C++ via the webview message handler.
+      // Returns a Promise that resolves with the result.
+      callTool: function(toolName, args) {
+        var requestId = 'req_' + (++window.kicadAi.requestCounter);
+        var msg = JSON.stringify({
+          tool: toolName,
+          args: args || {},
+          requestId: requestId
+        });
+        // Send to C++ via the registered webview message handler.
+        // On macOS (WKWebView) this is window.webkit.messageHandlers.tool_call
+        if( window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.tool_call ) {
+          window.webkit.messageHandlers.tool_call.postMessage(msg);
+        }
+        return new Promise(function(resolve, reject) {
+          window.kicadAi.pendingRequests[requestId] = { resolve: resolve, reject: reject };
+        });
+      },
+      // Called from C++ (via RunScriptAsync) when a tool result is ready.
+      onToolResult: function(response) {
+        var requestId = response.requestId;
+        var pending = window.kicadAi.pendingRequests[requestId];
+        if (pending) {
+          delete window.kicadAi.pendingRequests[requestId];
+          if (response.result && response.result.error) {
+            pending.reject(response.result.error);
+          } else {
+            pending.resolve(response.result);
+          }
+        }
       }
     };
-    // Prevent form submission / page navigation
     document.getElementById('msg-input').addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -211,15 +236,23 @@ AI_ASSISTANT_PANEL::AI_ASSISTANT_PANEL( wxWindow* parent, wxWindowID id,
 {
     m_backendURL = DEFAULT_BACKEND_URL;
 
-    // Try to load from the backend. If it's not running, the webview will
-    // show a load error, and we fall back to the built-in HTML page in
-    // OnWebViewLoaded / OnError.
-    //
-    // For now, just show the built-in page. When the backend is ready,
-    // call LoadFromURL() to switch.
-    loadDefaultPage();
+    // Allow localhost URLs to load inside the webview (don't redirect to
+    // the system browser).
+    SetHandleExternalLinks( true );
 
+    // Register the tool_call message handler BEFORE loading any page.
+    // DoInitHandlers() runs when the page finishes loading, and it iterates
+    // m_msgHandlers — so the handler must already be in the map by then.
     setupMessageHandlers();
+
+    // Bind the page-loaded event so DoInitHandlers() actually runs.
+    // Without this, OnWebViewLoaded never fires and AddScriptMessageHandler
+    // is never called on the WKWebView.
+    BindLoadedEvent();
+
+    // Try to load the backend; if it's not running, fall back to the
+    // built-in HTML chat UI.
+    tryLoadBackend();
 }
 
 
@@ -241,14 +274,40 @@ void AI_ASSISTANT_PANEL::loadDefaultPage()
 }
 
 
+void AI_ASSISTANT_PANEL::tryLoadBackend()
+{
+    // Try to connect to the backend. We attempt a blocking socket connection
+    // to localhost:3000 with a short timeout. If it connects, the backend is
+    // running and we load it in the webview. If not, we fall back to the
+    // built-in HTML.
+    wxIPV4address addr;
+    addr.Hostname( wxS( "localhost" ) );
+    addr.Service( 3000 );
+
+    wxSocketClient sock;
+    sock.SetTimeout( 2 ); // 2 second timeout
+
+    // Blocking connect — waits for the TCP handshake to complete
+    bool connected = sock.Connect( addr, true );
+
+    if( connected )
+    {
+        m_backendLoaded = true;
+        LoadURL( m_backendURL );
+    }
+    else
+    {
+        // Backend not running — show the built-in HTML.
+        m_backendLoaded = false;
+        loadDefaultPage();
+    }
+
+    sock.Close();
+}
+
+
 void AI_ASSISTANT_PANEL::setupMessageHandlers()
 {
-    // Register a message handler named "tool_call" that the web UI can invoke
-    // via window.webkit.messageHandlers.tool_call.postMessage(...).
-    //
-    // The web UI sends a JSON string containing the tool action and its
-    // parameters. This handler will parse it and dispatch to the appropriate
-    // C++ function (to be implemented in the tool bridge, Phase 2).
     AddMessageHandler( wxS( "tool_call" ),
         [this]( const wxString& aMessage )
         {
@@ -259,7 +318,12 @@ void AI_ASSISTANT_PANEL::setupMessageHandlers()
 
 void AI_ASSISTANT_PANEL::onToolCall( const wxString& aMessage )
 {
-    // Phase 2 will implement the actual tool dispatch here.
-    // For now, just log that we received a message.
-    wxLogTrace( wxS( "AiAssistant" ), wxS( "Received tool call: %s" ), aMessage );
+    if( m_toolCallHandler )
+    {
+        m_toolCallHandler( this, aMessage );
+    }
+    else
+    {
+        wxLogTrace( wxS( "AiAssistant" ), wxS( "Tool call received (no handler): %s" ), aMessage );
+    }
 }

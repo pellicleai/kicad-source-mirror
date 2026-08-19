@@ -30,6 +30,7 @@
 #include <dialogs/dialog_symbol_fields_table.h>
 #include <widgets/sch_design_block_pane.h>
 #include <widgets/panel_remote_symbol.h>
+#include <widgets/ai_tool_handler.h>
 #include <wx/srchctrl.h>
 #include <mail_type.h>
 #include <wx/clntdata.h>
@@ -235,6 +236,7 @@ SCH_EDIT_FRAME::SCH_EDIT_FRAME( KIWAY* aKiway, wxWindow* aParent ) :
     m_designBlocksPane = new SCH_DESIGN_BLOCK_PANE( this, nullptr, m_designBlockHistoryList );
 
     m_aiAssistantPanel = new AI_ASSISTANT_PANEL( this );
+    m_aiAssistantPanel->SetToolCallHandler( &handleSchToolCall );
 
     m_auimgr.SetManagedWindow( this );
 

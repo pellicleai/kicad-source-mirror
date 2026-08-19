@@ -337,6 +337,7 @@ set( EESCHEMA_WIDGETS
     widgets/sch_properties_panel.cpp
     widgets/sch_search_pane.cpp
     widgets/search_handlers.cpp
+    widgets/ai_tool_handler.cpp
     widgets/symbol_filter_combobox.cpp
     widgets/symbol_preview_widget.cpp
     widgets/symbol_tree_pane.cpp

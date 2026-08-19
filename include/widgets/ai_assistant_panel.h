@@ -21,6 +21,7 @@
 #define AI_ASSISTANT_PANEL_H
 
 #include <widgets/webview_panel.h>
+#include <functional>
 
 /**
  * A dockable sidebar panel that hosts an AI assistant chat interface.
@@ -37,6 +38,9 @@
 class AI_ASSISTANT_PANEL : public WEBVIEW_PANEL
 {
 public:
+    /// Callback type for tool calls. Takes the JSON message string.
+    using TOOL_CALL_HANDLER = std::function<void( AI_ASSISTANT_PANEL*, const wxString& )>;
+
     explicit AI_ASSISTANT_PANEL( wxWindow* parent, wxWindowID id = wxID_ANY,
                                  const wxPoint& pos = wxDefaultPosition,
                                  const wxSize& size = wxDefaultSize );
@@ -50,16 +54,26 @@ public:
 
     /**
      * Switch the webview to load from a backend URL instead of the built-in HTML.
-     * Call this when the backend server is running and you want the full chat UI.
      */
     void LoadFromURL( const wxString& url );
+
+    /**
+     * Set the tool call handler. This is called when a tool call message
+     * arrives from the webview. The handler is set by the editor frame
+     * (e.g. SCH_EDIT_FRAME) to dispatch tool calls to KiCad's internal
+     * functions.
+     */
+    void SetToolCallHandler( TOOL_CALL_HANDLER aHandler ) { m_toolCallHandler = std::move( aHandler ); }
 
 private:
     void setupMessageHandlers();
     void loadDefaultPage();
+    void tryLoadBackend();
     void onToolCall( const wxString& aMessage );
 
-    wxString m_backendURL;
+    wxString           m_backendURL;
+    bool               m_backendLoaded = false;
+    TOOL_CALL_HANDLER  m_toolCallHandler;
 };
 
 #endif // AI_ASSISTANT_PANEL_H
