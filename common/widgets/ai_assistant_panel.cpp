@@ -24,7 +24,7 @@
 #include <wx/sckaddr.h>
 
 // Default backend URL.
-static const wxString DEFAULT_BACKEND_URL = wxS( "http://localhost:3000" );
+static const wxString DEFAULT_BACKEND_URL = wxS( "http://localhost:9531" );
 
 // ---------------------------------------------------------------------------
 // Built-in HTML chat UI (shown when no backend is running)
@@ -160,7 +160,7 @@ R"HTML(<!DOCTYPE html>
     <input type="text" id="msg-input" placeholder="Type a message..." disabled />
     <button id="send-btn" disabled>Send</button>
   </div>
-  <div id="status">Backend: not connected (localhost:3000)</div>
+  <div id="status">Backend: not connected (localhost:9531)</div>
   <script>
     window.kicadAi = {
       enabled: false,
@@ -276,33 +276,15 @@ void AI_ASSISTANT_PANEL::loadDefaultPage()
 
 void AI_ASSISTANT_PANEL::tryLoadBackend()
 {
-    // Try to connect to the backend. We attempt a blocking socket connection
-    // to localhost:3000 with a short timeout. If it connects, the backend is
-    // running and we load it in the webview. If not, we fall back to the
-    // built-in HTML.
-    wxIPV4address addr;
-    addr.Hostname( wxS( "localhost" ) );
-    addr.Service( 3000 );
-
-    wxSocketClient sock;
-    sock.SetTimeout( 2 ); // 2 second timeout
-
-    // Blocking connect — waits for the TCP handshake to complete
-    bool connected = sock.Connect( addr, true );
-
-    if( connected )
-    {
-        m_backendLoaded = true;
-        LoadURL( m_backendURL );
-    }
-    else
-    {
-        // Backend not running — show the built-in HTML.
-        m_backendLoaded = false;
-        loadDefaultPage();
-    }
-
-    sock.Close();
+    // Always load the backend URL directly. The webview's JavaScript will
+    // handle the WebSocket connection and show a "connecting..." state.
+    // If the backend isn't running, the web UI shows a reconnect message
+    // and retries automatically.
+    //
+    // We previously tried a socket check here, but it was unreliable on
+    // macOS (IPv6 vs IPv4 mismatch with wxIPV4address).
+    m_backendLoaded = true;
+    LoadURL( m_backendURL );
 }
 
 

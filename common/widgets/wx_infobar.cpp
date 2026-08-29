@@ -428,7 +428,7 @@ void WX_INFOBAR::RemoveAllButtons()
 {
     wxSizer* sizer = GetSizer();
 
-    if( sizer->GetItemCount() == 0 )
+    if( !sizer || sizer->GetItemCount() == 0 )
         return;
 
     // The last item is already the spacer
@@ -445,8 +445,26 @@ void WX_INFOBAR::RemoveAllButtons()
 
         if( wxWindow* button = sItem->GetWindow() )
         {
-            sizer->Detach( button );
-            button->Destroy();
+            // The default close button created by wxInfoBarGeneric has ID
+            // wxID_CLOSE.  wxInfoBarGeneric stores a raw pointer (m_button)
+            // to this window and dereferences it from UpdateColours(), which
+            // fires on wxEVT_SYS_COLOUR_CHANGED.  If we Destroy() it here,
+            // that pointer dangles and the next colour-change event (e.g.
+            // from a display reconfiguration on macOS) crashes with a
+            // use-after-free / SIGBUS in UpdateColours().
+            //
+            // Hide-and-detach instead of destroy, matching what
+            // wxInfoBarGeneric::AddButton() does with the default button.
+            if( button->GetId() == wxID_CLOSE )
+            {
+                sizer->Detach( button );
+                button->Hide();
+            }
+            else
+            {
+                sizer->Detach( button );
+                button->Destroy();
+            }
         }
     }
 }
