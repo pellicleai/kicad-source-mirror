@@ -22,6 +22,7 @@
 
 #include <widgets/webview_panel.h>
 #include <functional>
+#include <wx/timer.h>
 
 /**
  * A dockable sidebar panel that hosts an AI assistant chat interface.
@@ -69,11 +70,15 @@ private:
     void setupMessageHandlers();
     void loadDefaultPage();
     void tryLoadBackend();
+    void onBackendLoadTimeout();   ///< Called by timer — falls back to built-in HTML
     void onToolCall( const wxString& aMessage );
 
     wxString           m_backendURL;
     bool               m_backendLoaded = false;
+    bool               m_fellBackToDefault = false;  ///< True if we loaded built-in HTML because backend was down
+    bool               m_pageLoaded = false;         ///< True once a page has finished loading in the webview
     TOOL_CALL_HANDLER  m_toolCallHandler;
+    wxTimer            m_retryTimer;  ///< Retries loading the backend URL
 };
 
 #endif // AI_ASSISTANT_PANEL_H

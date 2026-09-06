@@ -26,6 +26,13 @@
 // Default backend URL.
 static const wxString DEFAULT_BACKEND_URL = wxS( "http://localhost:9531" );
 
+// How long to wait for the backend page before falling back to the built-in UI.
+static const int BACKEND_LOAD_TIMEOUT_MS = 3000;
+
+// How often to re-check for the backend while showing the built-in UI, so that
+// starting the backend AFTER KiCad picks it up without restarting the editor.
+static const int BACKEND_RETRY_MS = 5000;
+
 // ---------------------------------------------------------------------------
 // Built-in HTML chat UI (shown when no backend is running)
 // ---------------------------------------------------------------------------
@@ -250,9 +257,45 @@ AI_ASSISTANT_PANEL::AI_ASSISTANT_PANEL( wxWindow* parent, wxWindowID id,
     // is never called on the WKWebView.
     BindLoadedEvent();
 
-    // Try to load the backend; if it's not running, fall back to the
-    // built-in HTML chat UI.
-    tryLoadBackend();
+    // Set up the retry timer — if the backend URL fails to load within
+    // 3 seconds, fall back to the built-in HTML so the panel isn't white.
+    m_retryTimer.SetOwner( this );
+    m_retryTimer.Bind( wxEVT_TIMER, [this]( wxTimerEvent& )
+    {
+        onBackendLoadTimeout();
+    } );
+
+    // Track whether the page ever finished loading, so the timeout below can
+    // tell "still loading" from "loaded fine" from "failed".
+    Bind( wxEVT_WEBVIEW_LOADED,
+          [this]( wxWebViewEvent& aEvt )
+          {
+              m_pageLoaded = true;
+              aEvt.Skip();
+          } );
+
+    // Paint the built-in UI immediately, before anything is loaded over the
+    // network. A wxWebView with no page is a stark white rectangle, and that is
+    // what the panel showed for the whole time the backend load was in flight or
+    // whenever it failed in a way that set neither the loaded nor the error flag.
+    // Starting from the built-in page means the worst case is a readable
+    // "no backend connected" panel rather than a blank one.
+    loadDefaultPage();
+
+    // Start the backend load from the event loop, NOT from this constructor.
+    //
+    // On localhost the page loads almost instantly, so calling tryLoadBackend()
+    // inline meant wxEVT_WEBVIEW_LOADED could fire while the parent editor frame
+    // was still being constructed — i.e. from inside a nested event loop. That
+    // reaches DoInitHandlers() -> AddScriptMessageHandler(), which internally
+    // runs script and yields the event loop again. WebKit's JSC cannot take that
+    // reentrant yield and throws, and the exception escapes frame construction as
+    // "Unhandled exception of unknown type", killing the editor before it opens.
+    //
+    // It only reproduced when the backend was actually up: with nothing serving
+    // port 9531 the load never completes, the event never fires, and the editor
+    // opens fine. Deferring the load lets the frame finish building first.
+    CallAfter( [this]() { tryLoadBackend(); } );
 }
 
 
@@ -284,7 +327,43 @@ void AI_ASSISTANT_PANEL::tryLoadBackend()
     // We previously tried a socket check here, but it was unreliable on
     // macOS (IPv6 vs IPv4 mismatch with wxIPV4address).
     m_backendLoaded = true;
+    m_fellBackToDefault = false;
+
+    // Reset before each attempt. Otherwise the flag left set by the built-in
+    // fallback page would make the next attempt look like it succeeded.
+    m_pageLoaded = false;
+
     LoadURL( m_backendURL );
+
+    m_retryTimer.StartOnce( BACKEND_LOAD_TIMEOUT_MS );
+}
+
+
+void AI_ASSISTANT_PANEL::onBackendLoadTimeout()
+{
+    // This timer does double duty. While the built-in page is showing it is a
+    // retry tick: check whether the backend has come up since last time.
+    if( m_fellBackToDefault )
+    {
+        tryLoadBackend();
+        return;
+    }
+
+    // Otherwise it is the load deadline for a backend attempt.
+    if( m_pageLoaded && !HasLoadError() )
+        return; // backend page is up
+
+    // Fall back if the page did not come up — either it reported an error, or it
+    // simply never finished loading. Checking only HasLoadError() left the panel
+    // blank whenever a load failed silently.
+    wxLogTrace( wxS( "AiAssistant" ), wxS( "Backend load failed — showing built-in HTML" ) );
+    m_fellBackToDefault = true;
+    loadDefaultPage();
+
+    // Keep looking for the backend. This removes the old requirement that the
+    // backend must be started BEFORE KiCad — start it whenever, and the panel
+    // switches over on its own.
+    m_retryTimer.StartOnce( BACKEND_RETRY_MS );
 }
 
 
@@ -300,12 +379,29 @@ void AI_ASSISTANT_PANEL::setupMessageHandlers()
 
 void AI_ASSISTANT_PANEL::onToolCall( const wxString& aMessage )
 {
-    if( m_toolCallHandler )
-    {
-        m_toolCallHandler( this, aMessage );
-    }
-    else
+    if( !m_toolCallHandler )
     {
         wxLogTrace( wxS( "AiAssistant" ), wxS( "Tool call received (no handler): %s" ), aMessage );
+        return;
     }
+
+    // Run the tool from the event loop rather than inline.
+    //
+    // This function is called from inside a WKWebView script message handler.
+    // Executing a tool inline means the whole tool -- library reads, ERC,
+    // connection graph rebuilds -- runs while WebKit is still waiting for its
+    // message callback to return, which blocks the webview and keeps the main
+    // thread from processing paint or focus events. The result is an app that
+    // appears hung and cannot be switched to.
+    //
+    // CallAfter() lets the message handler return immediately and runs the tool
+    // on the next event loop iteration instead. The reply path is already
+    // asynchronous (RunScriptAsync), so nothing downstream needs to change.
+    wxString message = aMessage;
+
+    CallAfter( [this, message]()
+    {
+        if( m_toolCallHandler )
+            m_toolCallHandler( this, message );
+    } );
 }

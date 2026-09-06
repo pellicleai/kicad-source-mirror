@@ -28,6 +28,15 @@
 #include <widgets/ai_assistant_panel.h>
 #include <wx/log.h>
 #include <wx/translation.h>
+#include <wx/mstream.h>
+#include <wx/image.h>
+#include <wx/dcclient.h>
+#include <wx/dcmemory.h>
+#include <wx/dir.h>
+#include <wx/filename.h>
+#include <common.h>
+#include <map>
+#include <set>
 
 #include <sch_edit_frame.h>
 #include <sch_base_frame.h>
@@ -47,10 +56,12 @@
 #include <sch_sheet_path.h>
 #include <sch_reference_list.h>
 #include <tool/tool_manager.h>
+#include <tool/actions.h>
 #include <gal/graphics_abstraction_layer.h>
 #include <view/view.h>
 #include <base_units.h>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <reporter.h>
 #include <symbol.h>
 
@@ -61,6 +72,8 @@
 #include <libraries/library_table.h>
 #include <pgm_base.h>
 #include <erc/erc.h>
+#include <sch_connection.h>
+#include <connection_graph.h>
 #include <tools/sch_line_wire_bus_tool.h>
 
 using json = nlohmann::json;
@@ -111,6 +124,16 @@ static wxString handleClearSchematic( AI_ASSISTANT_PANEL* aPanel, const json& aA
 static wxString handleGetPinPositions( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 static wxString handleConnectPins( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 static wxString handleConnectLabel( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleUndoLast( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleAddNoConnects( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+
+// Forward declaration — defined later, but needed by handleAddNoConnects
+static SCH_PIN* findPinByRef( SCH_SCREEN* aScreen, SCH_SHEET_PATH& aSheet,
+                                const wxString& aRef, const wxString& aPinNumber );
+
+static wxString handleScreenshot( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleGetSymbolInfo( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 
 
 // Helper: find the SCH_EDIT_FRAME parent of the panel by walking up the
@@ -200,6 +223,24 @@ static wxString handleAddSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
     // Convert mm to KiCad internal units and snap to grid (50 mils = 1.27mm)
     double xMm = aArgs.value( "x", 0.0 );
     double yMm = aArgs.value( "y", 0.0 );
+
+    // Clamp to the printable page area (A4 = 297x210mm, with margins)
+    // Components placed outside this area are invisible in print/exports
+    // and look broken to the user.
+    //
+    // The clamp is reported back in the result. Clamping silently used to make
+    // several out-of-bounds components collapse onto the same corner, which then
+    // looked like a placement bug rather than a plan bug.
+    const double requestedX = xMm;
+    const double requestedY = yMm;
+
+    if( xMm < 20.0 ) xMm = 20.0;
+    if( xMm > 270.0 ) xMm = 270.0;
+    if( yMm < 20.0 ) yMm = 20.0;
+    if( yMm > 190.0 ) yMm = 190.0;
+
+    const bool wasClamped = ( xMm != requestedX ) || ( yMm != requestedY );
+
     VECTOR2I position = mmToGrid( xMm, yMm );
 
     // Create the new schematic symbol from the library symbol
@@ -251,6 +292,189 @@ static wxString handleAddSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
     result["position"]["x"] = xMm;
     result["position"]["y"] = yMm;
 
+    if( wasClamped )
+    {
+        result["clamped"] = true;
+        result["requested_position"]["x"] = requestedX;
+        result["requested_position"]["y"] = requestedY;
+        result["warning"] = "Requested position was outside the printable page area "
+                            "(x 20-270mm, y 20-190mm) and was clamped. Choose "
+                            "coordinates inside that range so components do not stack.";
+    }
+
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+
+// ---------------------------------------------------------------------------
+// Tool: add_no_connects (batch)
+//
+// Adds no-connect flags on multiple pins in a single tool call.
+// This is critical for high-pin-count ICs (ESP32, ATmega328, etc.) where
+// calling add_no_connect 30+ times would exceed the tool call limit.
+//
+// Arguments (JSON):
+//   pins — array of { "ref": "U1", "pin": "3" } objects
+//
+// Returns (JSON):
+//   { "status": "ok", "added": 28, "skipped": 2, "errors": [...] }
+// ---------------------------------------------------------------------------
+static wxString handleAddNoConnects( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    if( !aArgs.contains( "pins" ) || !aArgs["pins"].is_array() )
+        return R"({ "error": "Missing 'pins' array argument" })";
+
+    SCH_SCREEN* screen = frame->GetScreen();
+    SCH_SHEET_PATH& currentSheet = frame->GetCurrentSheet();
+
+    SCH_COMMIT commit( frame->GetToolManager() );
+
+    int added = 0;
+    int skipped = 0;
+    json errors = json::array();
+
+    for( const auto& pinSpec : aArgs["pins"] )
+    {
+        wxString refStr = wxString::FromUTF8( pinSpec.value( "ref", "" ).c_str() );
+        wxString pinStr = wxString::FromUTF8( pinSpec.value( "pin", "" ).c_str() );
+
+        if( refStr.IsEmpty() || pinStr.IsEmpty() )
+        {
+            skipped++;
+            continue;
+        }
+
+        SCH_PIN* pin = findPinByRef( screen, currentSheet, refStr, pinStr );
+
+        if( !pin )
+        {
+            json err = { { "ref", std::string( refStr.ToUTF8() ) },
+                         { "pin", std::string( pinStr.ToUTF8() ) },
+                         { "error", "Pin not found" } };
+            errors.push_back( err );
+            skipped++;
+            continue;
+        }
+
+        VECTOR2I pos = pin->GetPosition();
+
+        // Check if pin already has wires
+        bool hasWires = false;
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+        {
+            if( item->GetLayer() != LAYER_WIRE )
+                continue;
+
+            SCH_LINE* line = static_cast<SCH_LINE*>( item );
+            if( line->IsEndPoint( pos ) )
+            {
+                hasWires = true;
+                break;
+            }
+        }
+
+        if( hasWires )
+        {
+            json err = { { "ref", std::string( refStr.ToUTF8() ) },
+                         { "pin", std::string( pinStr.ToUTF8() ) },
+                         { "error", "Pin already has wires" } };
+            errors.push_back( err );
+            skipped++;
+            continue;
+        }
+
+        // Check if no_connect already exists
+        bool exists = false;
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_NO_CONNECT_T ) )
+        {
+            if( item->GetPosition() == pos )
+            {
+                exists = true;
+                break;
+            }
+        }
+
+        if( exists )
+        {
+            skipped++;
+            continue;
+        }
+
+        SCH_NO_CONNECT* nc = new SCH_NO_CONNECT( pos );
+        frame->AddToScreen( nc, screen );
+        commit.Added( nc, screen );
+        frame->GetCanvas()->GetView()->Update( nc );
+        added++;
+    }
+
+    if( added > 0 )
+        commit.Push( _( "Add No-Connects (AI)" ) );
+
+    frame->GetCanvas()->Refresh();
+
+    json result;
+    result["status"] = "ok";
+    result["added"] = added;
+    result["skipped"] = skipped;
+    if( !errors.empty() )
+        result["errors"] = errors;
+
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+
+// ---------------------------------------------------------------------------
+// Tool: undo_last
+//
+// Undoes the last action (or last N actions) performed by the AI agent.
+// Uses KiCad's built-in undo stack — each tool call that modifies the
+// schematic pushes an undo entry, so this just pops it.
+//
+// Arguments (JSON):
+//   steps — (optional) number of actions to undo, default 1
+//
+// Returns (JSON):
+//   { "status": "ok", "undone": 2 }
+//   or { "error": "Nothing to undo" }
+// ---------------------------------------------------------------------------
+static wxString handleUndoLast( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    int steps = aArgs.value( "steps", 1 );
+    if( steps < 1 )
+        steps = 1;
+    if( steps > 20 )
+        steps = 20;
+
+    int undone = 0;
+
+    for( int i = 0; i < steps; i++ )
+    {
+        // Check if there's anything to undo
+        if( !frame->GetScreen() || frame->GetUndoCommandCount() == 0 )
+            break;
+
+        frame->GetToolManager()->RunAction( ACTIONS::undo );
+        undone++;
+    }
+
+    if( undone == 0 )
+        return R"({ "error": "Nothing to undo — the undo stack is empty" })";
+
+    frame->GetCanvas()->Refresh();
+
+    json result;
+    result["status"] = "ok";
+    result["undone"] = undone;
     return wxString::FromUTF8( result.dump().c_str() );
 }
 
@@ -560,7 +784,10 @@ static wxString handleConnectPins( AI_ASSISTANT_PANEL* aPanel, const json& aArgs
         segments = 2;
     }
 
-    commit.Push( _( "Connect Pins (AI)" ) );
+    // Only push if wires were actually created. Pushing an empty commit adds an
+    // undo entry that undoes nothing, which throws off undo_last(steps=N).
+    if( !commit.Empty() )
+        commit.Push( _( "Connect Pins (AI)" ) );
 
     // Recalculate the connection graph so ERC sees the new wires immediately.
     // Use LOCAL_CLEANUP (not GLOBAL_CLEANUP) because:
@@ -573,7 +800,13 @@ static wxString handleConnectPins( AI_ASSISTANT_PANEL* aPanel, const json& aArgs
     {
         SCH_COMMIT recalcCommit( frame->GetToolManager() );
         sch->RecalculateConnections( &recalcCommit, LOCAL_CLEANUP, frame->GetToolManager() );
-        recalcCommit.Push( _( "Recalculate (AI Connect)" ) );
+
+        // Only push if the recalculation actually changed something. Pushed
+        // unconditionally, this became a SECOND undo entry for one connect_pins
+        // call — so undo_last(steps=1) undid the recalculation and left the wires
+        // in place, while the caller believed the connection had been removed.
+        if( !recalcCommit.Empty() )
+            recalcCommit.Push( _( "Recalculate (AI Connect)" ) );
     }
 
     frame->GetCanvas()->Refresh();
@@ -668,7 +901,11 @@ static wxString handleConnectLabel( AI_ASSISTANT_PANEL* aPanel, const json& aArg
     {
         SCH_COMMIT recalcCommit( frame->GetToolManager() );
         sch->RecalculateConnections( &recalcCommit, LOCAL_CLEANUP, frame->GetToolManager() );
-        recalcCommit.Push( _( "Recalculate (AI Label)" ) );
+
+        // See connect_pins: an unconditional push here made one connect_label
+        // cost two undo steps.
+        if( !recalcCommit.Empty() )
+            recalcCommit.Push( _( "Recalculate (AI Label)" ) );
     }
 
     frame->GetCanvas()->Refresh();
@@ -680,6 +917,264 @@ static wxString handleConnectLabel( AI_ASSISTANT_PANEL* aPanel, const json& aArg
     result["pin"] = std::string( pinNum.ToUTF8() );
     result["position"]["x"] = schIUScale.IUTomm( pinPos.x );
     result["position"]["y"] = schIUScale.IUTomm( pinPos.y );
+
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+
+// ---------------------------------------------------------------------------
+// Tool: connect_net
+//
+// Puts every listed pin on the same net by placing a net label with the same
+// name at each pin's exact position, in ONE call and ONE undo step.
+//
+// This is the preferred way to express connectivity. Wiring pins pairwise with
+// connect_pins expresses a 3-pin net as two overlapping L-routes, and KiCad's
+// CleanUp() then merges collinear wires -- which turns a pin position from a
+// wire ENDPOINT into a wire MIDPOINT, at which point the connection graph stops
+// seeing that pin as connected and ERC reports "Pin not connected" for a pin
+// that visually has a wire on it.
+//
+// A label has no geometry to get wrong: it attaches at the pin position, and
+// pins sharing a net name are connected no matter where they sit on the sheet.
+//
+// Arguments (JSON):
+//   name — the net name, e.g. "+5V", "GND", "SDA"
+//   pins — array of either { "ref": "U1", "pin": "8" } objects or "U1.8" strings
+//   label_type — (optional) "local" (default) or "global"
+//
+// Returns (JSON):
+//   { "status": "ok", "net": "+5V", "connected": 3, "skipped": 0,
+//     "pins": ["R1.1", "U1.8", "C1.1"], "errors": [...] }
+// ---------------------------------------------------------------------------
+static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    wxString netName = wxString::FromUTF8( aArgs.value( "name", "" ).c_str() );
+
+    if( netName.IsEmpty() )
+        return R"({ "error": "Missing 'name' argument — the net name, e.g. \"GND\"" })";
+
+    if( !aArgs.contains( "pins" ) || !aArgs["pins"].is_array() )
+        return R"({ "error": "Missing 'pins' array argument, e.g. [{\"ref\":\"R1\",\"pin\":\"1\"}]" })";
+
+    if( aArgs["pins"].size() < 2 )
+    {
+        return R"({ "error": "A net needs at least 2 pins. To label a single pin, use connect_label." })";
+    }
+
+    wxString labelType = wxString::FromUTF8( aArgs.value( "label_type", "local" ).c_str() );
+
+    SCH_SCREEN*     screen = frame->GetScreen();
+    SCH_SHEET_PATH& currentSheet = frame->GetCurrentSheet();
+
+    SCH_COMMIT commit( frame->GetToolManager() );
+
+    int  connected = 0;
+    int  skipped = 0;
+    json errors = json::array();
+    json connectedPins = json::array();
+    json clearedNoConnects = json::array();
+
+    for( const auto& pinSpec : aArgs["pins"] )
+    {
+        wxString refStr;
+        wxString pinStr;
+
+        // Accept both { "ref": "U1", "pin": "8" } and the terser "U1.8" form.
+        if( pinSpec.is_string() )
+        {
+            wxString combined = wxString::FromUTF8( pinSpec.get<std::string>().c_str() );
+            refStr = combined.BeforeLast( '.' );
+            pinStr = combined.AfterLast( '.' );
+        }
+        else if( pinSpec.is_object() )
+        {
+            refStr = wxString::FromUTF8( pinSpec.value( "ref", "" ).c_str() );
+            pinStr = wxString::FromUTF8( pinSpec.value( "pin", "" ).c_str() );
+        }
+
+        if( refStr.IsEmpty() || pinStr.IsEmpty() )
+        {
+            errors.push_back( { { "pin", pinSpec.dump() },
+                                { "error", "Could not read ref and pin from this entry" } } );
+            skipped++;
+            continue;
+        }
+
+        // findPinByRef matches on pin number first and pin name second, so
+        // callers may pass either "8" or "VCC" without translating.
+        SCH_PIN* pin = findPinByRef( screen, currentSheet, refStr, pinStr );
+
+        if( !pin )
+        {
+            errors.push_back( { { "ref", std::string( refStr.ToUTF8() ) },
+                                { "pin", std::string( pinStr.ToUTF8() ) },
+                                { "error", "Pin not found on the schematic" } } );
+            skipped++;
+            continue;
+        }
+
+        VECTOR2I pinPos = pin->GetPosition();
+
+        // A no-connect and a net label on the same pin contradict each other.
+        //
+        // Naming a pin in a net is an explicit statement that it carries a signal,
+        // so it WINS: the stale no-connect is removed rather than the call being
+        // refused. Refusing produced a dead end — the error told the caller to
+        // "remove the no_connect first", but no tool can do that, so the same call
+        // was retried until the round ran out.
+        //
+        // The reverse direction stays blocked, in add_no_connects: putting a
+        // no-connect on a pin that already has a wire is simply wrong, not a
+        // change of intent.
+        SCH_NO_CONNECT* staleNoConnect = nullptr;
+
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_NO_CONNECT_T ) )
+        {
+            if( item->GetPosition() == pinPos )
+            {
+                staleNoConnect = static_cast<SCH_NO_CONNECT*>( item );
+                break;
+            }
+        }
+
+        if( staleNoConnect )
+        {
+            commit.Removed( staleNoConnect, screen );
+            frame->RemoveFromScreen( staleNoConnect, screen );
+            frame->GetCanvas()->GetView()->Remove( staleNoConnect );
+
+            clearedNoConnects.push_back(
+                    std::string( ( refStr + wxS( "." ) + pinStr ).ToUTF8() ) );
+        }
+
+        // Inspect any label already sitting on this pin.
+        //
+        // Same name  -> already done, skip quietly.
+        // DIFFERENT name -> refuse. Two different net names at one point ties
+        // those two nets together, which is a short. It is the most dangerous
+        // failure mode here because the schematic still looks correct, so this
+        // must be reported rather than silently added.
+        bool     alreadyLabelled = false;
+        bool     conflicting = false;
+        wxString conflictingName;
+
+        const KICAD_T checkTypes[] = { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T };
+
+        for( KICAD_T checkType : checkTypes )
+        {
+            for( SCH_ITEM* item : screen->Items().OfType( checkType ) )
+            {
+                SCH_LABEL_BASE* existing = static_cast<SCH_LABEL_BASE*>( item );
+
+                if( existing->GetPosition() != pinPos )
+                    continue;
+
+                if( existing->GetText() == netName )
+                {
+                    alreadyLabelled = true;
+                }
+                else
+                {
+                    conflicting = true;
+                    conflictingName = existing->GetText();
+                }
+
+                break;
+            }
+
+            if( alreadyLabelled || conflicting )
+                break;
+        }
+
+        if( conflicting )
+        {
+            errors.push_back( { { "ref", std::string( refStr.ToUTF8() ) },
+                                { "pin", std::string( pinStr.ToUTF8() ) },
+                                { "error", wxString::Format(
+                                      "Pin already carries net \"%s\". Adding \"%s\" here would "
+                                      "short the two nets together. Remove the existing label "
+                                      "first, or leave this pin off this net.",
+                                      conflictingName, netName ).ToStdString() } } );
+            skipped++;
+            continue;
+        }
+
+        if( alreadyLabelled )
+        {
+            connectedPins.push_back( std::string( ( refStr + wxS( "." ) + pinStr ).ToUTF8() ) );
+            connected++;
+            continue;
+        }
+
+        if( labelType == "global" )
+        {
+            SCH_GLOBALLABEL* glabel = new SCH_GLOBALLABEL( pinPos, netName );
+            frame->AddToScreen( glabel, screen );
+            commit.Added( glabel, screen );
+            frame->GetCanvas()->GetView()->Update( glabel );
+        }
+        else
+        {
+            SCH_LABEL* label = new SCH_LABEL( pinPos, netName );
+            frame->AddToScreen( label, screen );
+            commit.Added( label, screen );
+            frame->GetCanvas()->GetView()->Update( label );
+        }
+
+        // If a wire already runs through this pin as a midpoint, break it so the
+        // pin sits at an endpoint and the connection graph sees it.
+        if( SCH_LINE_WIRE_BUS_TOOL* lwbTool = frame->GetToolManager()->GetTool<SCH_LINE_WIRE_BUS_TOOL>() )
+            lwbTool->BreakSegments( &commit, pinPos, screen );
+
+        connectedPins.push_back( std::string( ( refStr + wxS( "." ) + pinStr ).ToUTF8() ) );
+        connected++;
+    }
+
+    // One commit for the whole net, so undo_last(1) removes the entire net
+    // rather than one label at a time.
+    if( !commit.Empty() )
+        commit.Push( _( "Connect Net (AI)" ) );
+
+    if( SCHEMATIC* sch = &frame->Schematic() )
+    {
+        SCH_COMMIT recalcCommit( frame->GetToolManager() );
+        sch->RecalculateConnections( &recalcCommit, LOCAL_CLEANUP, frame->GetToolManager() );
+
+        if( !recalcCommit.Empty() )
+            recalcCommit.Push( _( "Recalculate (AI Connect Net)" ) );
+    }
+
+    frame->GetCanvas()->Refresh();
+
+    json result;
+    result["status"] = "ok";
+    result["net"] = std::string( netName.ToUTF8() );
+    result["connected"] = connected;
+    result["skipped"] = skipped;
+    result["pins"] = connectedPins;
+
+    if( !errors.empty() )
+        result["errors"] = errors;
+
+    if( !clearedNoConnects.empty() )
+    {
+        result["cleared_no_connects"] = clearedNoConnects;
+        result["note"] = "These pins had a no-connect marker, which was removed so they "
+                         "could join this net. If a pin really is unused, leave it out of "
+                         "the net instead of no-connecting it afterwards.";
+    }
+
+    if( connected < 2 )
+    {
+        result["warning"] = "Fewer than 2 pins were connected, so this is not actually a net. "
+                            "Check the errors and re-issue with pins that exist.";
+    }
 
     return wxString::FromUTF8( result.dump().c_str() );
 }
@@ -733,7 +1228,19 @@ static wxString handleSetProperty( AI_ASSISTANT_PANEL* aPanel, const json& aArgs
     if( !target )
         return wxString::Format( R"({ "error": "Symbol not found: %s" })", ref );
 
-    // Apply the property change
+    // Reject an unknown property BEFORE opening a commit, so nothing is snapshot
+    // for a change that is not going to happen.
+    if( property != "value" && property != "footprint" && property != "reference" )
+    {
+        return wxString::Format( R"({ "error": "Unknown property: %s. Use 'value', 'footprint', or 'reference'." })", property );
+    }
+
+    // Snapshot BEFORE mutating, using Modify() not Modified() — see the note in
+    // handleMoveSymbol. Modified(item, aCopy, screen) was silently taking the
+    // SCREEN as the item's "before" copy and corrupting the undo stack.
+    SCH_COMMIT commit( frame->GetToolManager() );
+    commit.Modify( target, screen );
+
     if( property == "value" )
     {
         target->SetValueFieldText( newValue, &currentSheet );
@@ -746,14 +1253,7 @@ static wxString handleSetProperty( AI_ASSISTANT_PANEL* aPanel, const json& aArgs
     {
         target->SetRef( &currentSheet, newValue );
     }
-    else
-    {
-        return wxString::Format( R"({ "error": "Unknown property: %s. Use 'value', 'footprint', or 'reference'." })", property );
-    }
 
-    // Create undoable commit
-    SCH_COMMIT commit( frame->GetToolManager() );
-    commit.Modified( target, screen );
     commit.Push( _( "Set Property (AI)" ) );
 
     // Refresh canvas
@@ -802,66 +1302,167 @@ static wxString handleSearchSymbols( AI_ASSISTANT_PANEL* aPanel, const json& aAr
 
     std::vector<wxString> libNames = adapter->GetLibraryNames();
 
-    json symbolsArray = json::array();
-    int count = 0;
+    // Collect results with relevance score for sorting
+    struct SearchResult
+    {
+        wxString library_name;
+        wxString name;
+        wxString library;
+        wxString description;
+        wxString default_value;
+        int relevance; // lower = more relevant
+    };
+
+    // Cap at 20 results — the LLM can read 20 sorted results and pick the right
+    // one, but it cannot read hundreds. See also: relevance ordering below.
+    const int MAX_RESULTS = 20;
+
+    // Description matching requires parsing the symbol off disk. The standard
+    // KiCad libraries hold ~23,000 symbols in ~223 libraries, so loading every
+    // symbol on every search parses ~23,000 files on the UI thread and freezes
+    // the whole application for seconds at a time.
+    //
+    // Instead: match on symbol and library NAME first, which needs no disk
+    // access at all, and only load the handful of symbols we are actually going
+    // to return. Description matching stays available, but runs only when the
+    // name passes find nothing, and is bounded so it can never freeze the UI.
+    const int MAX_DESCRIPTION_SCAN = 4000;
+
+    std::vector<SearchResult> results;
 
     for( const wxString& libNickname : libNames )
     {
         std::vector<wxString> symNames = adapter->GetSymbolNames( libNickname );
 
+        wxString lowerLib = libNickname;
+        lowerLib.LowerCase();
+
         for( const wxString& symName : symNames )
         {
             wxString fullId = libNickname + wxS( ":" ) + symName;
 
-            // Load the symbol to get its description (needed for search)
-            LIB_SYMBOL* libSym = adapter->LoadSymbol( libNickname, symName );
-            wxString description;
-            wxString defaultValue;
-
-            if( libSym )
+            if( query.IsEmpty() )
             {
-                description = libSym->GetDescription();
-                defaultValue = libSym->GetValueField().GetText();
+                // No query — everything is equally (ir)relevant; capped below.
+                results.push_back( { fullId, symName, libNickname, wxEmptyString,
+                                     wxEmptyString, 5 } );
+                continue;
             }
 
-            // If a query is provided, filter by name, library, AND description
-            if( !query.IsEmpty() )
+            wxString lowerSym = symName;
+            lowerSym.LowerCase();
+
+            // Relevance: 0 = exact name, 1 = name starts with, 2 = name contains,
+            // 3 = library name contains. Description matches (4) are handled in
+            // the bounded fallback pass below.
+            int relevance = -1;
+
+            if( lowerSym == query )
+                relevance = 0;
+            else if( lowerSym.StartsWith( query ) )
+                relevance = 1;
+            else if( lowerSym.Contains( query ) )
+                relevance = 2;
+            else if( lowerLib.Contains( query ) )
+                relevance = 3;
+            else
+                continue; // no name-level match
+
+            results.push_back( { fullId, symName, libNickname, wxEmptyString,
+                                 wxEmptyString, relevance } );
+        }
+    }
+
+    // Fallback: nothing matched by name, so the query is probably descriptive
+    // ("current sense amplifier"). Scan descriptions, but stop as soon as we
+    // have enough results or have examined MAX_DESCRIPTION_SCAN symbols.
+    bool descriptionScanTruncated = false;
+
+    if( results.empty() && !query.IsEmpty() )
+    {
+        int examined = 0;
+
+        for( const wxString& libNickname : libNames )
+        {
+            if( (int) results.size() >= MAX_RESULTS || examined >= MAX_DESCRIPTION_SCAN )
+                break;
+
+            for( const wxString& symName : adapter->GetSymbolNames( libNickname ) )
             {
-                wxString lowerSym = symName;
-                lowerSym.LowerCase();
+                if( (int) results.size() >= MAX_RESULTS || examined >= MAX_DESCRIPTION_SCAN )
+                {
+                    descriptionScanTruncated = true;
+                    break;
+                }
 
-                wxString lowerLib = libNickname;
-                lowerLib.LowerCase();
+                examined++;
 
+                LIB_SYMBOL* libSym = adapter->LoadSymbol( libNickname, symName );
+
+                if( !libSym )
+                    continue;
+
+                wxString description = libSym->GetDescription();
                 wxString lowerDesc = description;
                 lowerDesc.LowerCase();
 
-                if( !lowerSym.Contains( query ) && !lowerLib.Contains( query ) && !lowerDesc.Contains( query ) )
+                if( !lowerDesc.Contains( query ) )
                     continue;
+
+                results.push_back( { libNickname + wxS( ":" ) + symName, symName,
+                                     libNickname, description,
+                                     libSym->GetValueField().GetText(), 4 } );
             }
+        }
+    }
 
-            json entry;
-            entry["library_name"] = std::string( fullId.ToUTF8() );
-            entry["name"] = std::string( symName.ToUTF8() );
-            entry["library"] = std::string( libNickname.ToUTF8() );
-            entry["description"] = std::string( description.ToUTF8() );
-            entry["default_value"] = std::string( defaultValue.ToUTF8() );
+    // Stable sort so that within the same relevance band the library order from
+    // the symbol table is preserved, which keeps results reproducible run to run.
+    std::stable_sort( results.begin(), results.end(),
+        []( const SearchResult& a, const SearchResult& b ) {
+            return a.relevance < b.relevance;
+        } );
 
-            symbolsArray.push_back( entry );
-            count++;
+    int count = std::min( (int) results.size(), MAX_RESULTS );
 
-            // Cap at 500 results to avoid massive responses
-            if( count >= 500 )
-                break;
+    json symbolsArray = json::array();
+
+    for( int i = 0; i < count; i++ )
+    {
+        SearchResult& r = results[i];
+
+        // Load the symbol only now, for the <= 20 entries we are returning, to
+        // fill in description and default value.
+        if( r.description.IsEmpty() && r.default_value.IsEmpty() )
+        {
+            if( LIB_SYMBOL* libSym = adapter->LoadSymbol( r.library, r.name ) )
+            {
+                r.description = libSym->GetDescription();
+                r.default_value = libSym->GetValueField().GetText();
+            }
         }
 
-        if( count >= 500 )
-            break;
+        json entry;
+        entry["library_name"] = std::string( r.library_name.ToUTF8() );
+        entry["name"] = std::string( r.name.ToUTF8() );
+        entry["library"] = std::string( r.library.ToUTF8() );
+        entry["description"] = std::string( r.description.ToUTF8() );
+        entry["default_value"] = std::string( r.default_value.ToUTF8() );
+
+        symbolsArray.push_back( entry );
     }
 
     json result;
     result["count"] = count;
+    result["total_matches"] = (int) results.size();
     result["symbols"] = symbolsArray;
+
+    if( descriptionScanTruncated )
+    {
+        result["note"] = "No symbol or library name matched, so descriptions were "
+                         "searched and the scan was truncated. Try a shorter or more "
+                         "specific keyword that appears in the symbol name.";
+    }
 
     return wxString::FromUTF8( result.dump().c_str() );
 }
@@ -873,17 +1474,27 @@ static wxString handleSearchSymbols( AI_ASSISTANT_PANEL* aPanel, const json& aAr
 // Searches KiCad's footprint library table for footprint libraries matching
 // a keyword. Returns the list of available footprint libraries.
 //
-// Note: Individual footprint names within each library are not enumerated
-// here because that requires pcbnew internals. The agent can construct
-// footprint IDs as "LibraryNickname:FootprintName" (e.g.
-// "Resistor_SMD:R_0603_1608Metric") using standard KiCad naming conventions.
+// Returns REAL footprint IDs, not just library names. KiCad footprint
+// libraries are ".pretty" directories holding one ".kicad_mod" file per
+// footprint, so the footprint names are enumerated by listing those files.
+// This needs no pcbnew internals.
+//
+// Returning real IDs matters: the caller previously had to invent footprint
+// names from "standard naming conventions", which produced footprints that do
+// not exist and silently broke the resulting board.
 //
 // Arguments (JSON):
-//   query   — (optional) search keyword, e.g. "Resistor", "Capacitor", "SOIC"
-//             If empty, returns ALL footprint libraries.
+//   query   — (optional) keyword matched against the footprint name and the
+//             library name, e.g. "R_Axial", "DIP-8", "LED_D3".
+//             Supports a trailing "*" wildcard, so KiCad footprint filters
+//             taken from get_symbol_info (e.g. "R_*") can be passed straight in.
+//   library — (optional) restrict the search to one library nickname.
 //
 // Returns (JSON):
-//   { "count": 42, "libraries": [ { "name": "Resistor_SMD", ... }, ... ] }
+//   { "count": 20, "total_matches": 137,
+//     "footprints": [ { "footprint": "Resistor_THT:R_Axial_DIN0207...",
+//                       "name": "R_Axial_DIN0207...", "library": "Resistor_THT" } ],
+//     "libraries": [ { "name": "Resistor_THT", "type": "footprint_library" } ] }
 // ---------------------------------------------------------------------------
 static wxString handleSearchFootprints( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
 {
@@ -895,40 +1506,121 @@ static wxString handleSearchFootprints( AI_ASSISTANT_PANEL* aPanel, const json& 
     wxString query = wxString::FromUTF8( aArgs.value( "query", "" ).c_str() );
     query.LowerCase();
 
-    // Use the global library manager to get footprint library rows.
-    // This avoids needing pcbnew headers — LIBRARY_MANAGER is in common/.
+    // KiCad footprint filters arrive as glob patterns like "R_*" or "LED_THT:*".
+    // Strip the library prefix and the wildcard so a filter can be passed
+    // through unmodified by the caller.
+    if( query.Contains( wxS( ":" ) ) )
+        query = query.AfterLast( ':' );
+
+    query.Replace( wxS( "*" ), wxEmptyString );
+    query.Replace( wxS( "?" ), wxEmptyString );
+    query.Trim( true ).Trim( false );
+
+    wxString libFilter = wxString::FromUTF8( aArgs.value( "library", "" ).c_str() );
+    libFilter.LowerCase();
+
     LIBRARY_MANAGER& libMgr = Pgm().GetLibraryManager();
     std::vector<LIBRARY_TABLE_ROW*> rows = libMgr.Rows( LIBRARY_TABLE_TYPE::FOOTPRINT );
 
+    // Cap results for the same reason search_symbols does — a long unsorted list
+    // is worse than a short relevant one.
+    const int MAX_RESULTS = 20;
+
+    struct FootprintResult
+    {
+        wxString library;
+        wxString name;
+        int      relevance; // lower = more relevant
+    };
+
+    std::vector<FootprintResult> matches;
     json libsArray = json::array();
-    int count = 0;
+    int  libCount = 0;
 
     for( const LIBRARY_TABLE_ROW* row : rows )
     {
         wxString libName = row->Nickname();
+        wxString lowerLib = libName;
+        lowerLib.LowerCase();
 
-        // If a query is provided, filter by it
-        if( !query.IsEmpty() )
+        if( !libFilter.IsEmpty() && lowerLib != libFilter )
+            continue;
+
+        json libEntry;
+        libEntry["name"] = std::string( libName.ToUTF8() );
+        libEntry["type"] = "footprint_library";
+        libsArray.push_back( libEntry );
+        libCount++;
+
+        // Resolve ${KICAD10_FOOTPRINT_DIR} and friends to a real path.
+        wxString uri = ExpandEnvVarSubstitutions( row->URI(), &frame->Prj() );
+
+        if( uri.IsEmpty() || !wxDirExists( uri ) )
+            continue;
+
+        wxDir dir( uri );
+
+        if( !dir.IsOpened() )
+            continue;
+
+        wxString fileName;
+        bool     hasFile = dir.GetFirst( &fileName, wxS( "*.kicad_mod" ), wxDIR_FILES );
+
+        while( hasFile )
         {
-            wxString lowerLib = libName;
-            lowerLib.LowerCase();
+            wxString fpName = fileName.BeforeLast( '.' );
+            wxString lowerFp = fpName;
+            lowerFp.LowerCase();
 
-            if( !lowerLib.Contains( query ) )
-                continue;
+            int relevance = -1;
+
+            if( query.IsEmpty() )
+                relevance = 5;
+            else if( lowerFp == query )
+                relevance = 0;
+            else if( lowerFp.StartsWith( query ) )
+                relevance = 1;
+            else if( lowerFp.Contains( query ) )
+                relevance = 2;
+            else if( lowerLib.Contains( query ) )
+                relevance = 3;
+
+            if( relevance >= 0 )
+                matches.push_back( { libName, fpName, relevance } );
+
+            hasFile = dir.GetNext( &fileName );
         }
+    }
+
+    std::stable_sort( matches.begin(), matches.end(),
+        []( const FootprintResult& a, const FootprintResult& b ) {
+            return a.relevance < b.relevance;
+        } );
+
+    int count = std::min( (int) matches.size(), MAX_RESULTS );
+
+    json footprintsArray = json::array();
+
+    for( int i = 0; i < count; i++ )
+    {
+        const FootprintResult& m = matches[i];
 
         json entry;
-        entry["name"] = std::string( libName.ToUTF8() );
-        entry["type"] = "footprint_library";
+        entry["footprint"] = std::string( ( m.library + wxS( ":" ) + m.name ).ToUTF8() );
+        entry["name"] = std::string( m.name.ToUTF8() );
+        entry["library"] = std::string( m.library.ToUTF8() );
 
-        libsArray.push_back( entry );
-        count++;
+        footprintsArray.push_back( entry );
     }
 
     json result;
     result["count"] = count;
+    result["total_matches"] = (int) matches.size();
+    result["footprints"] = footprintsArray;
     result["libraries"] = libsArray;
-    result["note"] = "Use 'LibraryName:FootprintName' format for footprint IDs, e.g. 'Resistor_SMD:R_0603_1608Metric'";
+    result["library_count"] = libCount;
+    result["note"] = "The 'footprint' field of each result is a real, verified footprint ID. "
+                     "Use it verbatim. Do not construct footprint IDs by hand.";
 
     return wxString::FromUTF8( result.dump().c_str() );
 }
@@ -1322,6 +2014,29 @@ static wxString handleRunErc( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
         {
             SCH_COMMIT breakCommit( frame->GetToolManager() );
 
+            // Collect every wire endpoint once, up front. BreakSegments() is
+            // only needed for a pin that sits in the MIDDLE of a wire — a pin
+            // already at an endpoint is visible to the connection graph as-is.
+            //
+            // Calling BreakSegments() unconditionally for every pin made this
+            // O(pins x wires) and was a major source of UI freezes on parts with
+            // high pin counts. Guarding on the endpoint set skips the vast
+            // majority of those calls while preserving the midpoint fix.
+            std::set<std::pair<int, int>> wireEndpoints;
+
+            for( SCH_ITEM* item : breakScreen->Items().OfType( SCH_LINE_T ) )
+            {
+                if( item->GetLayer() != LAYER_WIRE )
+                    continue;
+
+                SCH_LINE* line = static_cast<SCH_LINE*>( item );
+                VECTOR2I  start = line->GetStartPoint();
+                VECTOR2I  end = line->GetEndPoint();
+
+                wireEndpoints.emplace( start.x, start.y );
+                wireEndpoints.emplace( end.x, end.y );
+            }
+
             for( SCH_ITEM* item : breakScreen->Items().OfType( SCH_SYMBOL_T ) )
             {
                 SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
@@ -1329,6 +2044,10 @@ static wxString handleRunErc( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
                 for( SCH_PIN* pin : symbol->GetPins( &currentSheet ) )
                 {
                     VECTOR2I pinPos = pin->GetPosition();
+
+                    if( wireEndpoints.count( { pinPos.x, pinPos.y } ) )
+                        continue; // already an endpoint — nothing to break
+
                     lwbTool->BreakSegments( &breakCommit, pinPos, breakScreen );
                 }
             }
@@ -1343,7 +2062,12 @@ static wxString handleRunErc( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
     // Recalculate connections to build the connection graph
     SCH_COMMIT commit( frame->GetToolManager() );
     sch->RecalculateConnections( &commit, GLOBAL_CLEANUP, frame->GetToolManager() );
-    commit.Push( _( "Recalculate (AI ERC)" ) );
+
+    // run_erc is a read as far as the caller is concerned. Pushing here
+    // unconditionally added an undo entry every time ERC ran, so a few ERC passes
+    // silently buried the caller's real edits under entries that undo nothing.
+    if( !commit.Empty() )
+        commit.Push( _( "Recalculate (AI ERC)" ) );
 
     // Run ERC on the connection graph
     sch->ConnectionGraph()->RunERC();
@@ -1462,6 +2186,12 @@ static wxString handleMoveSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
     double xMm = aArgs.value( "x", 0.0 );
     double yMm = aArgs.value( "y", 0.0 );
 
+    // Clamp to the printable page area (A4 = 297x210mm, with margins)
+    if( xMm < 20.0 ) xMm = 20.0;
+    if( xMm > 270.0 ) xMm = 270.0;
+    if( yMm < 20.0 ) yMm = 20.0;
+    if( yMm > 190.0 ) yMm = 190.0;
+
     if( ref.IsEmpty() )
         return R"({ "error": "Missing 'ref' argument" })";
 
@@ -1485,10 +2215,24 @@ static wxString handleMoveSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
         return wxString::Format( R"({ "error": "Symbol not found: %s" })", ref );
 
     VECTOR2I newPos = mmToGrid( xMm, yMm );
+
+    // Snapshot BEFORE mutating, using Modify() rather than Modified().
+    //
+    // The old code mutated the symbol first and then called
+    //     commit.Modified( target, screen )
+    // but Modified() is Modified(item, aCopy, screen) -- so `screen` bound to
+    // aCopy. SCH_SCREEN derives from EDA_ITEM, so this compiled silently while
+    // handing the undo system the SCREEN as the symbol's "before" copy, which
+    // corrupts the undo stack and crashes on push.
+    //
+    // Modify(item, screen) is what the rest of eeschema uses: it takes the
+    // snapshot, and pulls the item from the screen's spatial index so its
+    // geometry can safely change.
+    SCH_COMMIT commit( frame->GetToolManager() );
+    commit.Modify( target, screen );
+
     target->SetPosition( newPos );
 
-    SCH_COMMIT commit( frame->GetToolManager() );
-    commit.Modified( target, screen );
     commit.Push( _( "Move Symbol (AI)" ) );
 
     frame->GetCanvas()->GetView()->Update( target );
@@ -1559,11 +2303,24 @@ static wxString handleRotateSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArg
     // Apply rotation the required number of 90-degree steps
     int steps = degrees / 90;
 
+    // Snapshot BEFORE mutating, using Modify() rather than Modified().
+    //
+    // The old code mutated the symbol first and then called
+    //     commit.Modified( target, screen )
+    // but Modified() is Modified(item, aCopy, screen) -- so `screen` bound to
+    // aCopy. SCH_SCREEN derives from EDA_ITEM, so this compiled silently while
+    // handing the undo system the SCREEN as the symbol's "before" copy, which
+    // corrupts the undo stack and crashes on push.
+    //
+    // Modify(item, screen) is what the rest of eeschema uses: it takes the
+    // snapshot, and pulls the item from the screen's spatial index so its
+    // geometry can safely change.
+    SCH_COMMIT commit( frame->GetToolManager() );
+    commit.Modify( target, screen );
+
     for( int i = 0; i < steps; i++ )
         target->Rotate( center, true ); // true = counter-clockwise
 
-    SCH_COMMIT commit( frame->GetToolManager() );
-    commit.Modified( target, screen );
     commit.Push( _( "Rotate Symbol (AI)" ) );
 
     frame->GetCanvas()->GetView()->Update( target );
@@ -1735,6 +2492,26 @@ void handleSchToolCall( AI_ASSISTANT_PANEL* aPanel, const wxString& aMessage )
     {
         result = handleConnectLabel( aPanel, args );
     }
+    else if( toolName == "connect_net" )
+    {
+        result = handleConnectNet( aPanel, args );
+    }
+    else if( toolName == "undo_last" )
+    {
+        result = handleUndoLast( aPanel, args );
+    }
+    else if( toolName == "add_no_connects" )
+    {
+        result = handleAddNoConnects( aPanel, args );
+    }
+    else if( toolName == "screenshot" )
+    {
+        result = handleScreenshot( aPanel, args );
+    }
+    else if( toolName == "get_symbol_info" )
+    {
+        result = handleGetSymbolInfo( aPanel, args );
+    }
     else
     {
         result = wxString::Format( R"({ "error": "Unknown tool: %s" })", toolName );
@@ -1764,15 +2541,269 @@ void handleSchToolCall( AI_ASSISTANT_PANEL* aPanel, const wxString& aMessage )
 
 
 // ---------------------------------------------------------------------------
+// Tool: get_symbol_info
+//
+// Loads a symbol from KiCad's library WITHOUT placing it on the schematic.
+// Returns complete component information: pins (name, number, electrical type,
+// position), unit count, description, datasheet URL, footprint filters, and
+// default reference prefix.
+//
+// The planner uses this to get exact pin information before building the plan,
+// instead of relying on training knowledge which may be wrong.
+//
+// Arguments (JSON):
+//   library_name — full symbol ID, e.g. "Device:R", "Timer:NE555P"
+//
+// Returns (JSON):
+//   { "status": "ok", "library_name": "Device:LED", "name": "LED",
+//     "description": "Light emitting diode", "datasheet": "",
+//     "unit_count": 1, "default_ref": "D", "default_value": "LED",
+//     "footprint_filters": ["LED_*"],
+//     "pins": [ { "name": "A", "number": "1", "type": "passive", "unit": 1, "x": 0, "y": 0 }, ... ] }
+// ---------------------------------------------------------------------------
+static wxString handleGetSymbolInfo( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    wxString libraryName = wxString::FromUTF8( aArgs.value( "library_name", "" ).c_str() );
+
+    if( libraryName.IsEmpty() )
+        return R"({ "error": "Missing 'library_name' argument. Example: Device:R" })";
+
+    // Split "Library:Symbol" into parts
+    int colonPos = libraryName.Find( ':' );
+
+    if( colonPos == wxNOT_FOUND )
+        return R"({ "error": "Invalid library_name format. Must be 'Library:Symbol', e.g. 'Device:R'" })";
+
+    wxString libNickname = libraryName.Left( colonPos );
+    wxString symName = libraryName.Mid( colonPos + 1 );
+
+    SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( &frame->Prj() );
+
+    if( !adapter )
+        return R"({ "error": "Symbol library adapter not available" })";
+
+    LIB_SYMBOL* libSym = adapter->LoadSymbol( libNickname, symName );
+
+    if( !libSym )
+    {
+        wxString err = wxString::Format( R"({ "error": "Symbol '%s' not found in library '%s'" })",
+                                          symName.ToUTF8(), libNickname.ToUTF8() );
+        return err;
+    }
+
+    json result;
+    result["status"] = "ok";
+    result["library_name"] = std::string( libraryName.ToUTF8() );
+    result["name"] = std::string( libSym->GetName().ToUTF8() );
+    result["description"] = std::string( libSym->GetDescription().ToUTF8() );
+    result["datasheet"] = std::string( libSym->GetDatasheetField().GetText().ToUTF8() );
+    result["unit_count"] = libSym->GetUnitCount();
+    result["default_ref"] = std::string( libSym->GetReferenceField().GetText().ToUTF8() );
+    result["default_value"] = std::string( libSym->GetValueField().GetText().ToUTF8() );
+
+    // Footprint filters — tells which footprints are compatible
+    wxArrayString fpFilters = libSym->GetFPFilters();
+    json filtersArray = json::array();
+    for( const wxString& filter : fpFilters )
+        filtersArray.push_back( std::string( filter.ToUTF8() ) );
+    result["footprint_filters"] = filtersArray;
+
+    // Pins — name, number, electrical type, unit, position
+    std::vector<SCH_PIN*> pins = libSym->GetPins();
+    json pinsArray = json::array();
+
+    for( SCH_PIN* pin : pins )
+    {
+        json pinEntry;
+        pinEntry["name"] = std::string( pin->GetName().ToUTF8() );
+        pinEntry["number"] = std::string( pin->GetNumber().ToUTF8() );
+
+        // Electrical type as readable string
+        ELECTRICAL_PINTYPE pinType = pin->GetType();
+        wxString typeStr;
+
+        switch( pinType )
+        {
+            case ELECTRICAL_PINTYPE::PT_INPUT:         typeStr = "input"; break;
+            case ELECTRICAL_PINTYPE::PT_OUTPUT:        typeStr = "output"; break;
+            case ELECTRICAL_PINTYPE::PT_BIDI:          typeStr = "bidirectional"; break;
+            case ELECTRICAL_PINTYPE::PT_PASSIVE:       typeStr = "passive"; break;
+            case ELECTRICAL_PINTYPE::PT_NIC:           typeStr = "not_internally_connected"; break;
+            case ELECTRICAL_PINTYPE::PT_UNSPECIFIED:    typeStr = "unspecified"; break;
+            case ELECTRICAL_PINTYPE::PT_POWER_IN:      typeStr = "power_in"; break;
+            case ELECTRICAL_PINTYPE::PT_POWER_OUT:     typeStr = "power_out"; break;
+            case ELECTRICAL_PINTYPE::PT_OPENCOLLECTOR: typeStr = "open_collector"; break;
+            case ELECTRICAL_PINTYPE::PT_OPENEMITTER:   typeStr = "open_emitter"; break;
+            case ELECTRICAL_PINTYPE::PT_NC:            typeStr = "no_connect"; break;
+            default:                                    typeStr = "unknown"; break;
+        }
+
+        pinEntry["type"] = std::string( typeStr.ToUTF8() );
+        pinEntry["unit"] = pin->GetUnit();
+
+        VECTOR2I pinPos = pin->GetPosition();
+        pinEntry["x"] = schIUScale.IUTomm( pinPos.x );
+        pinEntry["y"] = schIUScale.IUTomm( pinPos.y );
+
+        pinsArray.push_back( pinEntry );
+    }
+
+    result["pin_count"] = (int) pins.size();
+    result["pins"] = pinsArray;
+
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+
+// ---------------------------------------------------------------------------
+// Tool: screenshot
+//
+// Captures the current eeschema canvas as a base64-encoded PNG image.
+// The evaluator agent uses this to visually assess placement, overlap,
+// and layout quality — things that JSON data alone cannot convey.
+//
+// Returns (JSON):
+//   { "status": "ok", "image": "iVBORw0KGgo...", "width": 800, "height": 600 }
+// ---------------------------------------------------------------------------
+static wxString handleScreenshot( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    SCH_DRAW_PANEL* canvas = frame->GetCanvas();
+
+    if( !canvas )
+        return R"({ "error": "No canvas found" })";
+
+    // Force a refresh so the screenshot reflects the latest state.
+    //
+    // Deliberately no wxYield() here. This runs inside a WebKit script message
+    // handler, and yielding re-enters the event loop from there -- the exact
+    // reentrancy that WEBVIEW_PANEL::DoInitHandlers() guards against because it
+    // crashes JSC in sanitizeStackForVM. Update() paints synchronously without
+    // pumping the event loop.
+    canvas->Refresh();
+    canvas->Update();
+
+    // Get the canvas window and capture it
+    // SCH_DRAW_PANEL derives from wxWindow (via EDA_DRAW_PANEL)
+    wxWindow* canvasWin = dynamic_cast<wxWindow*>( canvas );
+
+    if( !canvasWin )
+        canvasWin = static_cast<wxWindow*>( canvas );
+
+    if( !canvasWin )
+        return R"({ "error": "No canvas window found" })";
+
+    wxSize size = canvasWin->GetClientSize();
+
+    if( size.GetWidth() <= 0 || size.GetHeight() <= 0 )
+        return R"({ "error": "Canvas has invalid size" })";
+
+    // Capture the canvas content into a bitmap
+    wxBitmap bitmap( size );
+    wxClientDC dc( canvasWin );
+    wxMemoryDC memDC;
+
+    memDC.SelectObject( bitmap );
+    memDC.Blit( 0, 0, size.GetWidth(), size.GetHeight(), &dc, 0, 0 );
+    memDC.SelectObject( wxNullBitmap );
+
+    // Convert bitmap to PNG
+    wxImage image = bitmap.ConvertToImage();
+
+    if( !image.IsOk() )
+        return R"({ "error": "Failed to convert bitmap to image" })";
+
+    wxMemoryOutputStream stream;
+    image.SaveFile( stream, wxBITMAP_TYPE_PNG );
+
+    wxStreamBuffer* streamBuf = stream.GetOutputStreamBuffer();
+    size_t dataSize = streamBuf->GetBufferSize();
+    const unsigned char* data = static_cast<const unsigned char*>( streamBuf->GetBufferStart() );
+
+    // Base64 encode
+    static const char base64Chars[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::string base64;
+    base64.reserve( ( dataSize + 2 ) / 3 * 4 );
+
+    for( size_t i = 0; i < dataSize; i += 3 )
+    {
+        unsigned int n = data[i] << 16;
+
+        if( i + 1 < dataSize )
+            n |= data[i + 1] << 8;
+        if( i + 2 < dataSize )
+            n |= data[i + 2];
+
+        base64 += base64Chars[( n >> 18 ) & 0x3F];
+        base64 += base64Chars[( n >> 12 ) & 0x3F];
+        base64 += ( i + 1 < dataSize ) ? base64Chars[( n >> 6 ) & 0x3F ] : '=';
+        base64 += ( i + 2 < dataSize ) ? base64Chars[n & 0x3F] : '=';
+    }
+
+    json result;
+    result["status"] = "ok";
+    result["image"] = base64;
+    result["width"] = size.GetWidth();
+    result["height"] = size.GetHeight();
+    result["format"] = "png";
+
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+
+// ---------------------------------------------------------------------------
 // Tool: get_schematic
 //
 // Returns all symbols currently on the schematic with their properties.
 //
 // Returns (JSON):
-//   { "count": 3, "components": [
-//     { "ref": "R1", "value": "10k", "library": "Device:R",
-//       "footprint": "Resistor_THT:...", "x": 50, "y": 50 }, ... ] }
+//   { "count": 3,
+//     "components": [ { "ref": "R1", ..., "pins": [ { ..., "net": "+5V" } ] } ],
+//     "wires":      [ { "from": {"x":..,"y":..,"ref":"R1","pin":"1"}, "to": {...} } ],
+//     "labels":     [ { "text": "+5V", "x": .., "y": .., "ref": "R1", "pin": "1" } ],
+//     "junctions":  [ { "x": .., "y": .. } ],
+//     "no_connects":[ { "x": .., "y": .., "ref": "U1", "pin": "3" } ],
+//     "nets":       [ { "name": "+5V", "pins": [ "R1.1", "U1.8" ] } ] }
+//
+// The "nets" array is the authoritative connectivity answer — it comes from
+// KiCad's own connection graph, not from tracing wire geometry. Two pins are
+// electrically connected if and only if they share a net name. Use this rather
+// than trying to follow "wires" by hand.
 // ---------------------------------------------------------------------------
+
+// Helper: if a point coincides with a symbol pin, record which ref/pin it is.
+static void annotatePointWithPin( SCH_SCREEN* aScreen, SCH_SHEET_PATH& aSheet,
+                                  const VECTOR2I& aPos, json& aTarget )
+{
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        for( SCH_PIN* pin : symbol->GetPins( &aSheet ) )
+        {
+            if( pin->GetPosition() == aPos )
+            {
+                aTarget["ref"] = std::string( symbol->GetRef( &aSheet, true ).ToUTF8() );
+                aTarget["pin"] = std::string( pin->GetNumber().ToUTF8() );
+                aTarget["pin_name"] = std::string( pin->GetName().ToUTF8() );
+                return;
+            }
+        }
+    }
+}
+
+
 static wxString handleGetSchematic( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
 {
     SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
@@ -1782,6 +2813,25 @@ static wxString handleGetSchematic( AI_ASSISTANT_PANEL* aPanel, const json& aArg
 
     SCH_SCREEN* screen = frame->GetScreen();
     SCH_SHEET_PATH& currentSheet = frame->GetCurrentSheet();
+
+    // Build the connection graph so per-pin net names are current. Without this
+    // the "net" fields below are stale (or empty) right after a wiring change,
+    // which is exactly when the caller needs them. LOCAL_CLEANUP is used rather
+    // than GLOBAL_CLEANUP so this read-only tool does not merge collinear wires
+    // and destroy junctions that connect_pins just created.
+    if( SCHEMATIC* sch = &frame->Schematic() )
+    {
+        SCH_COMMIT recalcCommit( frame->GetToolManager() );
+        sch->RecalculateConnections( &recalcCommit, LOCAL_CLEANUP, frame->GetToolManager() );
+
+        // Only push if something actually changed, so a plain read does not
+        // pollute the undo stack with empty entries.
+        if( !recalcCommit.Empty() )
+            recalcCommit.Push( _( "Recalculate (AI Read)" ) );
+    }
+
+    // Accumulates net name -> list of "REF.pin" as we walk the pins below.
+    std::map<wxString, std::vector<wxString>> netMap;
 
     json componentsArray = json::array();
     int count = 0;
@@ -1840,6 +2890,19 @@ static wxString handleGetSchematic( AI_ASSISTANT_PANEL* aPanel, const json& aArg
             wxString elecType = pin->GetElectricalTypeName();
             pinEntry["electric_type"] = std::string( elecType.ToUTF8() );
 
+            // The net this pin belongs to, straight from the connection graph.
+            // This is the ground truth for "is this pin connected to that one" —
+            // two pins are connected exactly when their net names match.
+            wxString netName;
+
+            if( SCH_CONNECTION* conn = pin->Connection( &currentSheet ) )
+                netName = conn->Name( true );
+
+            pinEntry["net"] = std::string( netName.ToUTF8() );
+
+            if( !netName.IsEmpty() )
+                netMap[netName].push_back( ref + wxS( "." ) + pin->GetNumber() );
+
             pinsArray.push_back( pinEntry );
         }
 
@@ -1849,9 +2912,117 @@ static wxString handleGetSchematic( AI_ASSISTANT_PANEL* aPanel, const json& aArg
         count++;
     }
 
+    // ── Wires ──
+    // Each wire endpoint is annotated with the ref/pin it lands on (if any) so
+    // the caller does not have to match floating point coordinates itself.
+    json wiresArray = json::array();
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+    {
+        if( item->GetLayer() != LAYER_WIRE )
+            continue;
+
+        SCH_LINE* line = static_cast<SCH_LINE*>( item );
+        VECTOR2I  start = line->GetStartPoint();
+        VECTOR2I  end   = line->GetEndPoint();
+
+        json from;
+        from["x"] = schIUScale.IUTomm( start.x );
+        from["y"] = schIUScale.IUTomm( start.y );
+        annotatePointWithPin( screen, currentSheet, start, from );
+
+        json to;
+        to["x"] = schIUScale.IUTomm( end.x );
+        to["y"] = schIUScale.IUTomm( end.y );
+        annotatePointWithPin( screen, currentSheet, end, to );
+
+        json wireEntry;
+        wireEntry["from"] = from;
+        wireEntry["to"] = to;
+        wiresArray.push_back( wireEntry );
+    }
+
+    // ── Labels ──
+    // Local, global and hierarchical labels all carry net names, so all three
+    // types are reported. connect_label can create local or global labels.
+    json labelsArray = json::array();
+
+    const KICAD_T labelTypes[] = { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T };
+
+    for( KICAD_T labelType : labelTypes )
+    {
+        for( SCH_ITEM* item : screen->Items().OfType( labelType ) )
+        {
+            SCH_LABEL_BASE* label = static_cast<SCH_LABEL_BASE*>( item );
+            VECTOR2I        pos = label->GetPosition();
+
+            json labelEntry;
+            labelEntry["text"] = std::string( label->GetText().ToUTF8() );
+            labelEntry["type"] = ( labelType == SCH_GLOBAL_LABEL_T ) ? "global"
+                                 : ( labelType == SCH_HIER_LABEL_T ) ? "hierarchical"
+                                                                     : "local";
+            labelEntry["x"] = schIUScale.IUTomm( pos.x );
+            labelEntry["y"] = schIUScale.IUTomm( pos.y );
+            annotatePointWithPin( screen, currentSheet, pos, labelEntry );
+
+            labelsArray.push_back( labelEntry );
+        }
+    }
+
+    // ── Junctions ──
+    json junctionsArray = json::array();
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_JUNCTION_T ) )
+    {
+        VECTOR2I pos = item->GetPosition();
+
+        json junctionEntry;
+        junctionEntry["x"] = schIUScale.IUTomm( pos.x );
+        junctionEntry["y"] = schIUScale.IUTomm( pos.y );
+        junctionsArray.push_back( junctionEntry );
+    }
+
+    // ── No-connects ──
+    json noConnectsArray = json::array();
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_NO_CONNECT_T ) )
+    {
+        VECTOR2I pos = item->GetPosition();
+
+        json ncEntry;
+        ncEntry["x"] = schIUScale.IUTomm( pos.x );
+        ncEntry["y"] = schIUScale.IUTomm( pos.y );
+        annotatePointWithPin( screen, currentSheet, pos, ncEntry );
+
+        noConnectsArray.push_back( ncEntry );
+    }
+
+    // ── Nets ──
+    json netsArray = json::array();
+
+    for( const auto& [netName, pinRefs] : netMap )
+    {
+        json netEntry;
+        netEntry["name"] = std::string( netName.ToUTF8() );
+
+        json pinList = json::array();
+
+        for( const wxString& pinRef : pinRefs )
+            pinList.push_back( std::string( pinRef.ToUTF8() ) );
+
+        netEntry["pins"] = pinList;
+        netEntry["pin_count"] = (int) pinRefs.size();
+        netsArray.push_back( netEntry );
+    }
+
     json result;
     result["count"] = count;
     result["components"] = componentsArray;
+    result["wires"] = wiresArray;
+    result["labels"] = labelsArray;
+    result["junctions"] = junctionsArray;
+    result["no_connects"] = noConnectsArray;
+    result["nets"] = netsArray;
 
     return wxString::FromUTF8( result.dump().c_str() );
 }

@@ -184,6 +184,10 @@ bool WEBVIEW_PANEL::AddMessageHandler( const wxString& aName, MESSAGE_HANDLER aH
         }
         else
         {
+            // Same reasoning as DoInitHandlers(): registering a name twice raises
+            // an uncatchable ObjC exception, so drop any existing one first.
+            browser->RemoveScriptMessageHandler( aName );
+
             if( !browser->AddScriptMessageHandler( aName ) )
                 wxLogTrace( "webview", "Could not add script message handler %s", aName );
         }
@@ -240,8 +244,20 @@ void WEBVIEW_PANEL::DoInitHandlers()
         return;
     }
 
+    // Remove before adding. WKUserContentController raises an Objective-C
+    // NSException ("a script message handler with this name already exists") if
+    // the same name is registered twice, and an ObjC exception cannot be caught
+    // by C++ code here — it escapes the event handler and surfaces as KiCad's
+    // "Unhandled exception of unknown type", killing the editor.
+    //
+    // This runs on EVERY page load by design (the handler must be re-registered
+    // after a navigation or it is silently lost), and WebKit reports a load more
+    // than once per page — the initial empty document, then the real one. So the
+    // second call is normal and must be made safe rather than avoided.
     for( const auto& handler : m_msgHandlers )
     {
+        browser->RemoveScriptMessageHandler( handler.first );
+
         if( !browser->AddScriptMessageHandler( handler.first ) )
             wxLogTrace( "webview", "Could not add script message handler %s", handler.first );
     }
@@ -275,15 +291,17 @@ void WEBVIEW_PANEL::DoInitHandlers()
 
 void WEBVIEW_PANEL::OnWebViewLoaded( wxWebViewEvent& aEvt )
 {
-    if( !m_initialized )
-    {
-        m_initialized = true;
+    // Re-register message handlers on EVERY page load, not just the first.
+    // If the webview fell back to built-in HTML (backend was down) and then
+    // reloaded the backend URL, the handlers were only registered for the
+    // first page. Without this, window.webkit.messageHandlers.tool_call is
+    // undefined on the backend page and all tool calls fail.
+    m_initialized = true;
 
-        if( m_toolManager && m_tool )
-            m_toolManager->RunMainStack( m_tool, [this]() { DoInitHandlers(); } );
-        else
-            m_initRetryTimer.StartOnce( 1 );
-    }
+    if( m_toolManager && m_tool )
+        m_toolManager->RunMainStack( m_tool, [this]() { DoInitHandlers(); } );
+    else
+        m_initRetryTimer.StartOnce( 1 );
 
     aEvt.Skip();
 }
