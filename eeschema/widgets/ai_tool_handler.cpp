@@ -962,9 +962,13 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
     if( !aArgs.contains( "pins" ) || !aArgs["pins"].is_array() )
         return R"({ "error": "Missing 'pins' array argument, e.g. [{\"ref\":\"R1\",\"pin\":\"1\"}]" })";
 
-    if( aArgs["pins"].size() < 2 )
+    // A single-pin net is allowed. Putting one pin on "+5V" is how a supply rail
+    // is expressed, and step-by-step building creates one-pin nets routinely --
+    // the second pin arrives on a later turn. Rejecting them forced the caller to
+    // invent two-pin nets with meaningless names just to get past the check.
+    if( aArgs["pins"].empty() )
     {
-        return R"({ "error": "A net needs at least 2 pins. To label a single pin, use connect_label." })";
+        return R"({ "error": "The 'pins' array is empty. List at least one pin to put on this net." })";
     }
 
     wxString labelType = wxString::FromUTF8( aArgs.value( "label_type", "local" ).c_str() );
