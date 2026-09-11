@@ -125,6 +125,10 @@ static wxString handleGetPinPositions( AI_ASSISTANT_PANEL* aPanel, const json& a
 static wxString handleConnectPins( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 static wxString handleConnectLabel( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleRedoLast( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleRemoveNoConnect( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleFindPart( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
+static wxString handleCheck( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 static wxString handleUndoLast( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 static wxString handleAddNoConnects( AI_ASSISTANT_PANEL* aPanel, const json& aArgs );
 
@@ -217,12 +221,113 @@ static wxString handleAddSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
     if( !fieldFootprint.IsEmpty() )
         picked.Fields.emplace_back( FIELD_T::FOOTPRINT, fieldFootprint );
 
-    if( !fieldReference.IsEmpty() )
-        picked.Fields.emplace_back( FIELD_T::REFERENCE, fieldReference );
+    // Assign a concrete reference if the caller did not give one.
+    //
+    // Without this KiCad uses the symbol's default, which is the prefix plus a
+    // question mark -- "R?" -- and the sheet then needs annotate() to turn every
+    // "?" into a number. Annotation RENUMBERS, so a part placed as "D" could come
+    // back as "D101", and anything holding the old reference was then pointing at
+    // something that no longer existed.
+    //
+    // Picking the next free number here makes the reference final the moment the
+    // part lands, and it is returned to the caller immediately.
+    if( fieldReference.IsEmpty() )
+    {
+        // Prefix comes from the symbol itself (R for resistors, C, U, D...).
+        wxString prefix = libSymbol->GetReferenceField().GetText();
+        prefix.Replace( wxS( "?" ), wxEmptyString );
 
-    // Convert mm to KiCad internal units and snap to grid (50 mils = 1.27mm)
+        if( prefix.IsEmpty() )
+            prefix = wxS( "U" );
+
+        // Highest number already used by that prefix on this sheet.
+        int highest = 0;
+
+        for( SCH_ITEM* item : frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            wxString existing = static_cast<SCH_SYMBOL*>( item )->GetRef( &currentSheet, true );
+
+            if( !existing.StartsWith( prefix ) )
+                continue;
+
+            wxString digits = existing.Mid( prefix.Length() );
+            long     n = 0;
+
+            if( digits.ToLong( &n ) && n > highest )
+                highest = (int) n;
+        }
+
+        fieldReference = wxString::Format( wxS( "%s%d" ), prefix, highest + 1 );
+    }
+
+    picked.Fields.emplace_back( FIELD_T::REFERENCE, fieldReference );
+
+    // Position. If the caller did not give one, find a free spot rather than
+    // making the caller invent coordinates.
+    //
+    // x and y used to be required, and a language model has no spatial sense --
+    // it produced overlapping parts, and coordinates outside the page that were
+    // then clamped so several components collapsed onto the same corner. It is
+    // the same failure as inventing footprints: a required field with no real
+    // source. Layout is arithmetic, so the code should do it.
+    const bool havePosition = aArgs.contains( "x" ) && aArgs.contains( "y" );
+
     double xMm = aArgs.value( "x", 0.0 );
     double yMm = aArgs.value( "y", 0.0 );
+
+    if( !havePosition )
+    {
+        // Where everything already sits.
+        std::vector<VECTOR2I> taken;
+
+        for( SCH_ITEM* item : frame->GetScreen()->Items().OfType( SCH_SYMBOL_T ) )
+            taken.push_back( item->GetPosition() );
+
+        // Walk the printable area left to right, top to bottom, and stop at the
+        // first slot far enough from everything already placed. The step is wide
+        // enough that symbol bodies and their reference/value text do not collide.
+        const double STEP_X = 30.0;
+        const double STEP_Y = 35.0;
+        const double CLEARANCE_MM = 20.0;
+
+        bool found = false;
+
+        for( double y = 40.0; y <= 180.0 && !found; y += STEP_Y )
+        {
+            for( double x = 40.0; x <= 260.0 && !found; x += STEP_X )
+            {
+                VECTOR2I candidate = mmToGrid( x, y );
+                bool     clear = true;
+
+                for( const VECTOR2I& other : taken )
+                {
+                    double dx = schIUScale.IUTomm( std::abs( candidate.x - other.x ) );
+                    double dy = schIUScale.IUTomm( std::abs( candidate.y - other.y ) );
+
+                    if( dx < CLEARANCE_MM && dy < CLEARANCE_MM )
+                    {
+                        clear = false;
+                        break;
+                    }
+                }
+
+                if( clear )
+                {
+                    xMm = x;
+                    yMm = y;
+                    found = true;
+                }
+            }
+        }
+
+        // Sheet is full. Place it anyway rather than refusing — the caller can
+        // move things, and check() reports the overlap.
+        if( !found )
+        {
+            xMm = 40.0;
+            yMm = 40.0;
+        }
+    }
 
     // Clamp to the printable page area (A4 = 297x210mm, with margins)
     // Components placed outside this area are invisible in print/exports
@@ -259,8 +364,7 @@ static wxString handleAddSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
     if( !fieldFootprint.IsEmpty() )
         symbol->SetFootprintFieldText( fieldFootprint );
 
-    if( !fieldReference.IsEmpty() )
-        symbol->SetRef( &currentSheet, fieldReference );
+    symbol->SetRef( &currentSheet, fieldReference );
 
     // Autoplace fields (reference, value, etc.)
     symbol->AutoplaceFields( nullptr, AUTOPLACE_AUTO );
@@ -2424,10 +2528,6 @@ void handleSchToolCall( AI_ASSISTANT_PANEL* aPanel, const wxString& aMessage )
     {
         result = handleAddSymbol( aPanel, args );
     }
-    else if( toolName == "search_symbols" )
-    {
-        result = handleSearchSymbols( aPanel, args );
-    }
     else if( toolName == "search_footprints" )
     {
         result = handleSearchFootprints( aPanel, args );
@@ -2444,30 +2544,6 @@ void handleSchToolCall( AI_ASSISTANT_PANEL* aPanel, const wxString& aMessage )
     {
         result = handleSetProperty( aPanel, args );
     }
-    else if( toolName == "draw_wire" )
-    {
-        result = handleDrawWire( aPanel, args );
-    }
-    else if( toolName == "add_label" )
-    {
-        result = handleAddLabel( aPanel, args );
-    }
-    else if( toolName == "add_junction" )
-    {
-        result = handleAddJunction( aPanel, args );
-    }
-    else if( toolName == "add_no_connect" )
-    {
-        result = handleAddNoConnect( aPanel, args );
-    }
-    else if( toolName == "annotate" )
-    {
-        result = handleAnnotate( aPanel, args );
-    }
-    else if( toolName == "run_erc" )
-    {
-        result = handleRunErc( aPanel, args );
-    }
     else if( toolName == "move_symbol" )
     {
         result = handleMoveSymbol( aPanel, args );
@@ -2476,29 +2552,25 @@ void handleSchToolCall( AI_ASSISTANT_PANEL* aPanel, const wxString& aMessage )
     {
         result = handleRotateSymbol( aPanel, args );
     }
-    else if( toolName == "add_text" )
-    {
-        result = handleAddText( aPanel, args );
-    }
-    else if( toolName == "clear_schematic" )
-    {
-        result = handleClearSchematic( aPanel, args );
-    }
-    else if( toolName == "get_pin_positions" )
-    {
-        result = handleGetPinPositions( aPanel, args );
-    }
-    else if( toolName == "connect_pins" )
-    {
-        result = handleConnectPins( aPanel, args );
-    }
-    else if( toolName == "connect_label" )
-    {
-        result = handleConnectLabel( aPanel, args );
-    }
     else if( toolName == "connect_net" )
     {
         result = handleConnectNet( aPanel, args );
+    }
+    else if( toolName == "redo_last" )
+    {
+        result = handleRedoLast( aPanel, args );
+    }
+    else if( toolName == "remove_no_connect" )
+    {
+        result = handleRemoveNoConnect( aPanel, args );
+    }
+    else if( toolName == "find_part" )
+    {
+        result = handleFindPart( aPanel, args );
+    }
+    else if( toolName == "check" )
+    {
+        result = handleCheck( aPanel, args );
     }
     else if( toolName == "undo_last" )
     {
@@ -2507,14 +2579,6 @@ void handleSchToolCall( AI_ASSISTANT_PANEL* aPanel, const wxString& aMessage )
     else if( toolName == "add_no_connects" )
     {
         result = handleAddNoConnects( aPanel, args );
-    }
-    else if( toolName == "screenshot" )
-    {
-        result = handleScreenshot( aPanel, args );
-    }
-    else if( toolName == "get_symbol_info" )
-    {
-        result = handleGetSymbolInfo( aPanel, args );
     }
     else
     {
@@ -3192,6 +3256,567 @@ static wxString handleClearSchematic( AI_ASSISTANT_PANEL* aPanel, const json& aA
     result["removed"]["junctions"] = junctionCount;
     result["removed"]["no_connects"] = noConnectCount;
     result["removed"]["texts"] = textCount;
+
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+// ---------------------------------------------------------------------------
+// Tool: redo_last
+//
+// Restores what undo_last reversed. KiCad has always had redo; it was simply
+// never exposed, which meant an undo that went too far destroyed work
+// permanently. Pairing the two makes over-undoing recoverable rather than fatal.
+// ---------------------------------------------------------------------------
+static wxString handleRedoLast( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    int steps = aArgs.value( "steps", 1 );
+
+    if( steps < 1 )
+        steps = 1;
+
+    int redone = 0;
+
+    for( int i = 0; i < steps; i++ )
+    {
+        if( !frame->GetScreen() || frame->GetRedoCommandCount() == 0 )
+            break;
+
+        frame->GetToolManager()->RunAction( ACTIONS::redo );
+        redone++;
+    }
+
+    if( redone == 0 )
+        return R"({ "error": "Nothing to redo" })";
+
+    frame->GetCanvas()->Refresh();
+
+    json result;
+    result["status"] = "ok";
+    result["redone"] = redone;
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+
+// ---------------------------------------------------------------------------
+// Tool: remove_no_connect
+//
+// Clears the "deliberately unused" marker from a pin so it can join a net.
+//
+// Without this the caller could reach a dead end: a pin marked unused could not
+// be connected, and the error telling it to remove the marker named an action no
+// tool could perform. It retried instead, until the round ran out.
+// ---------------------------------------------------------------------------
+static wxString handleRemoveNoConnect( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    wxString ref = wxString::FromUTF8( aArgs.value( "ref", "" ).c_str() );
+    wxString pinId = wxString::FromUTF8( aArgs.value( "pin", "" ).c_str() );
+
+    if( ref.IsEmpty() || pinId.IsEmpty() )
+        return R"({ "error": "Missing 'ref' or 'pin'" })";
+
+    SCH_SCREEN*     screen = frame->GetScreen();
+    SCH_SHEET_PATH& currentSheet = frame->GetCurrentSheet();
+
+    SCH_PIN* pin = findPinByRef( screen, currentSheet, ref, pinId );
+
+    if( !pin )
+        return wxString::Format( R"({ "error": "Pin not found: %s pin %s" })", ref, pinId );
+
+    VECTOR2I pinPos = pin->GetPosition();
+
+    SCH_NO_CONNECT* target = nullptr;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_NO_CONNECT_T ) )
+    {
+        if( item->GetPosition() == pinPos )
+        {
+            target = static_cast<SCH_NO_CONNECT*>( item );
+            break;
+        }
+    }
+
+    if( !target )
+    {
+        // Already in the desired state. Reporting success rather than an error
+        // matters: an error here invites a retry of something already true.
+        json ok;
+        ok["status"] = "ok";
+        ok["removed"] = false;
+        ok["note"] = "That pin had no unused marker — nothing to remove.";
+        return wxString::FromUTF8( ok.dump().c_str() );
+    }
+
+    SCH_COMMIT commit( frame->GetToolManager() );
+    commit.Removed( target, screen );
+    frame->RemoveFromScreen( target, screen );
+    frame->GetCanvas()->GetView()->Remove( target );
+    commit.Push( _( "Remove No-Connect (AI)" ) );
+
+    if( SCHEMATIC* sch = &frame->Schematic() )
+    {
+        SCH_COMMIT recalcCommit( frame->GetToolManager() );
+        sch->RecalculateConnections( &recalcCommit, LOCAL_CLEANUP, frame->GetToolManager() );
+
+        if( !recalcCommit.Empty() )
+            recalcCommit.Push( _( "Recalculate (AI)" ) );
+    }
+
+    frame->GetCanvas()->Refresh();
+
+    json result;
+    result["status"] = "ok";
+    result["removed"] = true;
+    result["ref"] = std::string( ref.ToUTF8() );
+    result["pin"] = std::string( pin->GetNumber().ToUTF8() );
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+// ---------------------------------------------------------------------------
+// Tool: find_part
+//
+// Replaces search_symbols + get_symbol_info, which were never used apart: you
+// searched to find a symbol id, then immediately asked what its pins were. Two
+// round trips, and when the second was skipped the caller had no footprint and
+// invented one.
+//
+// Returning both together is also SMALLER, because full detail is only needed
+// for the part actually being placed. Each candidate carries just enough to
+// judge it — pin names and a footprint count — and the best match carries the
+// real footprint ids to copy.
+//
+// The footprint count is the important signal. A symbol with none is not a
+// physical part: it is a simulation or documentation symbol, and no amount of
+// name matching makes it buildable. That single number distinguishes
+// Switch:SW_Push from Simulation_SPICE:SWITCH, and a real resistor from
+// Device:VoltageDivider, without any hardcoded list of parts to avoid.
+// ---------------------------------------------------------------------------
+static wxString handleFindPart( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    wxString rawQuery = wxString::FromUTF8( aArgs.value( "query", "" ).c_str() );
+
+    if( rawQuery.IsEmpty() )
+        return R"({ "error": "Missing 'query'. Say what the part is, e.g. \"resistor\"." })";
+
+    SYMBOL_LIBRARY_ADAPTER* adapter = PROJECT_SCH::SymbolLibAdapter( &frame->Prj() );
+
+    if( !adapter )
+        return R"({ "error": "Symbol library not available" })";
+
+    // An exact "Library:Symbol" id means the caller already knows what it wants,
+    // so skip the search entirely and describe just that part.
+    const bool exactId = rawQuery.Contains( wxS( ":" ) );
+
+    struct Candidate
+    {
+        wxString libId;
+        wxString libNickname;
+        wxString symName;
+        int      relevance;
+    };
+
+    std::vector<Candidate> candidates;
+
+    if( exactId )
+    {
+        candidates.push_back( { rawQuery,
+                                rawQuery.BeforeFirst( ':' ),
+                                rawQuery.AfterFirst( ':' ),
+                                0 } );
+    }
+    else
+    {
+        wxString query = rawQuery;
+        query.LowerCase();
+
+        // Name and library matching only — no symbol is loaded from disk here.
+        // Loading every symbol to search descriptions meant ~23,000 file reads
+        // per call, which blew the tool timeout and killed runs before they ever
+        // reached wiring.
+        for( const wxString& libNickname : adapter->GetLibraryNames() )
+        {
+            wxString lowerLib = libNickname;
+            lowerLib.LowerCase();
+
+            for( const wxString& symName : adapter->GetSymbolNames( libNickname ) )
+            {
+                wxString lowerSym = symName;
+                lowerSym.LowerCase();
+
+                int relevance = -1;
+
+                if( lowerSym == query )                 relevance = 0;
+                else if( lowerSym.StartsWith( query ) ) relevance = 1;
+                else if( lowerSym.Contains( query ) )   relevance = 2;
+                else if( lowerLib.Contains( query ) )   relevance = 3;
+                else                                    continue;
+
+                candidates.push_back( { libNickname + wxS( ":" ) + symName,
+                                        libNickname, symName, relevance } );
+            }
+        }
+
+        std::stable_sort( candidates.begin(), candidates.end(),
+                          []( const Candidate& a, const Candidate& b )
+                          { return a.relevance < b.relevance; } );
+    }
+
+    if( candidates.empty() )
+    {
+        json none;
+        none["status"] = "ok";
+        none["count"] = 0;
+        none["parts"] = json::array();
+        none["note"] = "Nothing matched. Search for the COMPONENT rather than the "
+                       "circuit — a divider is two resistors, so search \"resistor\".";
+        return wxString::FromUTF8( none.dump().c_str() );
+    }
+
+    const size_t MAX_CANDIDATES = 5;
+    const size_t shown = std::min( candidates.size(), MAX_CANDIDATES );
+
+    json parts = json::array();
+
+    for( size_t i = 0; i < shown; i++ )
+    {
+        const Candidate& c = candidates[i];
+
+        LIB_SYMBOL* sym = adapter->LoadSymbol( c.libNickname, c.symName );
+
+        if( !sym )
+            continue;
+
+        json entry;
+        entry["symbol"] = std::string( c.libId.ToUTF8() );
+        entry["description"] = std::string( sym->GetDescription().ToUTF8() );
+
+        // Pins: names and numbers are short, and they are what distinguishes a
+        // real part from a lookalike. A plain resistor has two unnamed pins; a
+        // potentiometer has three.
+        json pins = json::array();
+
+        for( SCH_PIN* pin : sym->GetPins() )
+        {
+            json p;
+            p["number"] = std::string( pin->GetNumber().ToUTF8() );
+            p["name"] = std::string( pin->GetName().ToUTF8() );
+            p["type"] = std::string( pin->GetElectricalTypeName().ToUTF8() );
+            pins.push_back( p );
+        }
+
+        entry["pins"] = pins;
+        entry["pin_count"] = (int) pins.size();
+
+        // Real footprints for this symbol, resolved from its own filters.
+        std::vector<wxString> footprints;
+
+        for( const wxString& filter : sym->GetFPFilters() )
+        {
+            wxString pattern = filter;
+            pattern.Replace( wxS( "*" ), wxEmptyString );
+            pattern.Replace( wxS( "?" ), wxEmptyString );
+
+            if( pattern.Contains( wxS( ":" ) ) )
+                pattern = pattern.AfterLast( ':' );
+
+            pattern.LowerCase();
+
+            LIBRARY_MANAGER& libMgr = Pgm().GetLibraryManager();
+
+            for( const LIBRARY_TABLE_ROW* row : libMgr.Rows( LIBRARY_TABLE_TYPE::FOOTPRINT ) )
+            {
+                wxString uri = ExpandEnvVarSubstitutions( row->URI(), &frame->Prj() );
+
+                if( uri.IsEmpty() || !wxDirExists( uri ) )
+                    continue;
+
+                wxDir dir( uri );
+
+                if( !dir.IsOpened() )
+                    continue;
+
+                wxString fileName;
+                bool     more = dir.GetFirst( &fileName, wxS( "*.kicad_mod" ), wxDIR_FILES );
+
+                while( more && footprints.size() < 40 )
+                {
+                    wxString fpName = fileName.BeforeLast( '.' );
+                    wxString lowerFp = fpName;
+                    lowerFp.LowerCase();
+
+                    if( pattern.IsEmpty() || lowerFp.StartsWith( pattern ) )
+                        footprints.push_back( row->Nickname() + wxS( ":" ) + fpName );
+
+                    more = dir.GetNext( &fileName );
+                }
+            }
+        }
+
+        entry["footprint_count"] = (int) footprints.size();
+
+        // Full ids only for the best match — the rest just need the count so the
+        // caller can tell a real part from one that cannot be built.
+        if( i == 0 )
+        {
+            json fps = json::array();
+
+            for( size_t f = 0; f < std::min<size_t>( footprints.size(), 8 ); f++ )
+                fps.push_back( std::string( footprints[f].ToUTF8() ) );
+
+            entry["footprints"] = fps;
+        }
+
+        if( footprints.empty() )
+        {
+            entry["warning"] = "No footprints exist for this symbol, so it is not a "
+                               "physical part — it is for simulation or documentation "
+                               "and cannot be built.";
+        }
+
+        parts.push_back( entry );
+    }
+
+    json result;
+    result["status"] = "ok";
+    result["count"] = (int) parts.size();
+    result["total_matches"] = (int) candidates.size();
+    result["parts"] = parts;
+
+    return wxString::FromUTF8( result.dump().c_str() );
+}
+
+// ---------------------------------------------------------------------------
+// Tool: check
+//
+// Answers "is this schematic sound?" — the question the caller needs after
+// building or changing anything, and the one an LLM used to be asked to answer
+// by eye. It could not: a language model reading a netlist invented wiring
+// errors on circuits that were electrically perfect. Correctness here is
+// decidable, so it is decided in code.
+//
+// Runs KiCad's own electrical rule check, and adds what that check does not
+// cover: footprints that do not exist, parts sitting on top of each other, and
+// duplicate references. Those are all reasons a board cannot be built, so they
+// belong in the same answer rather than in a separate tool the caller might not
+// think to call.
+//
+// Footprint problems are ONE category. Missing, invented and wildcarded all mean
+// the same thing to the reader — this part cannot be manufactured — and each
+// comes with real footprints that would work.
+// ---------------------------------------------------------------------------
+static wxString handleCheck( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
+{
+    SCH_EDIT_FRAME* frame = getSchEditFrame( aPanel );
+
+    if( !frame )
+        return R"({ "error": "No schematic editor found" })";
+
+    json problems = json::array();
+    json warnings = json::array();
+
+    // ── KiCad's electrical rule check ──
+    wxString ercRaw = handleRunErc( aPanel, json::object() );
+    json     erc;
+
+    try
+    {
+        erc = json::parse( std::string( ercRaw.ToUTF8() ) );
+    }
+    catch( ... )
+    {
+        erc = json::object();
+    }
+
+    if( erc.contains( "markers" ) )
+    {
+        for( const auto& marker : erc["markers"] )
+        {
+            json entry;
+            entry["kind"] = "electrical";
+            entry["message"] = marker.value( "message", "" );
+
+            if( marker.contains( "ref" ) )
+            {
+                entry["ref"] = marker["ref"];
+                entry["pin"] = marker.value( "pin", "" );
+
+                if( marker.contains( "pin_name" ) )
+                    entry["pin_name"] = marker["pin_name"];
+            }
+
+            if( marker.value( "severity", "" ) == "error" )
+                problems.push_back( entry );
+            else
+                warnings.push_back( entry );
+        }
+    }
+
+    SCH_SCREEN*     screen = frame->GetScreen();
+    SCH_SHEET_PATH& currentSheet = frame->GetCurrentSheet();
+
+    std::vector<SCH_SYMBOL*> symbols;
+
+    for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+        symbols.push_back( static_cast<SCH_SYMBOL*>( item ) );
+
+    // ── Footprints ──
+    // Gather real footprint names once, so an invalid one can be answered with
+    // working alternatives rather than just rejected.
+    std::set<wxString> realFootprints;
+    {
+        LIBRARY_MANAGER& libMgr = Pgm().GetLibraryManager();
+
+        for( const LIBRARY_TABLE_ROW* row : libMgr.Rows( LIBRARY_TABLE_TYPE::FOOTPRINT ) )
+        {
+            wxString uri = ExpandEnvVarSubstitutions( row->URI(), &frame->Prj() );
+
+            if( uri.IsEmpty() || !wxDirExists( uri ) )
+                continue;
+
+            wxDir dir( uri );
+
+            if( !dir.IsOpened() )
+                continue;
+
+            wxString fileName;
+            bool     more = dir.GetFirst( &fileName, wxS( "*.kicad_mod" ), wxDIR_FILES );
+
+            while( more )
+            {
+                realFootprints.insert( row->Nickname() + wxS( ":" ) + fileName.BeforeLast( '.' ) );
+                more = dir.GetNext( &fileName );
+            }
+        }
+    }
+
+    for( SCH_SYMBOL* sym : symbols )
+    {
+        wxString ref = sym->GetRef( &currentSheet, true );
+        wxString fp = sym->GetFootprintFieldText( true, &currentSheet, false );
+
+        bool bad = fp.IsEmpty() || !fp.Contains( wxS( ":" ) )
+                   || fp.Contains( wxS( "*" ) ) || fp.Contains( wxS( "?" ) )
+                   || !realFootprints.count( fp );
+
+        if( !bad )
+            continue;
+
+        json entry;
+        entry["kind"] = "footprint";
+        entry["ref"] = std::string( ref.ToUTF8() );
+        entry["message"] = fp.IsEmpty()
+                ? std::string( "has no footprint" )
+                : ( "footprint \"" + std::string( fp.ToUTF8() ) + "\" does not exist" );
+
+        // Offer real options, taken from this symbol's own filters.
+        json options = json::array();
+
+        if( LIB_SYMBOL* libSym = sym->GetLibSymbolRef().get() )
+        {
+            for( const wxString& filter : libSym->GetFPFilters() )
+            {
+                wxString pattern = filter;
+                pattern.Replace( wxS( "*" ), wxEmptyString );
+                pattern.Replace( wxS( "?" ), wxEmptyString );
+
+                if( pattern.Contains( wxS( ":" ) ) )
+                    pattern = pattern.AfterLast( ':' );
+
+                pattern.LowerCase();
+
+                for( const wxString& real : realFootprints )
+                {
+                    if( options.size() >= 3 )
+                        break;
+
+                    wxString name = real.AfterFirst( ':' );
+                    name.LowerCase();
+
+                    if( pattern.IsEmpty() || name.StartsWith( pattern ) )
+                        options.push_back( std::string( real.ToUTF8() ) );
+                }
+
+                if( options.size() >= 3 )
+                    break;
+            }
+        }
+
+        if( !options.empty() )
+            entry["try"] = options;
+
+        problems.push_back( entry );
+    }
+
+    // ── Overlapping parts ──
+    // Two symbols on top of each other are unreadable, and usually mean a
+    // position was guessed rather than chosen.
+    const double OVERLAP_MM = 8.0;
+
+    for( size_t i = 0; i < symbols.size(); i++ )
+    {
+        for( size_t j = i + 1; j < symbols.size(); j++ )
+        {
+            VECTOR2I a = symbols[i]->GetPosition();
+            VECTOR2I b = symbols[j]->GetPosition();
+
+            double dx = schIUScale.IUTomm( std::abs( a.x - b.x ) );
+            double dy = schIUScale.IUTomm( std::abs( a.y - b.y ) );
+
+            if( dx >= OVERLAP_MM || dy >= OVERLAP_MM )
+                continue;
+
+            json entry;
+            entry["kind"] = "layout";
+            entry["ref"] = std::string( symbols[i]->GetRef( &currentSheet, true ).ToUTF8() );
+            entry["message"] = "overlaps "
+                    + std::string( symbols[j]->GetRef( &currentSheet, true ).ToUTF8() );
+            warnings.push_back( entry );
+        }
+    }
+
+    // ── Duplicate references ──
+    // Two parts sharing a reference make the netlist ambiguous and the bill of
+    // materials wrong.
+    std::map<wxString, int> refCounts;
+
+    for( SCH_SYMBOL* sym : symbols )
+        refCounts[sym->GetRef( &currentSheet, true )]++;
+
+    for( const auto& [ref, count] : refCounts )
+    {
+        if( count < 2 )
+            continue;
+
+        json entry;
+        entry["kind"] = "reference";
+        entry["ref"] = std::string( ref.ToUTF8() );
+        entry["message"] = std::to_string( count ) + " parts share this reference";
+        problems.push_back( entry );
+    }
+
+    json result;
+    result["status"] = "ok";
+    result["ok"] = problems.empty();
+    result["component_count"] = (int) symbols.size();
+    result["problems"] = problems;
+    result["warnings"] = warnings;
+
+    if( problems.empty() && warnings.empty() )
+        result["note"] = "Nothing wrong found.";
 
     return wxString::FromUTF8( result.dump().c_str() );
 }
