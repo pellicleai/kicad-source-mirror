@@ -358,35 +358,67 @@ static bool routeWireBetween( SCH_EDIT_FRAME* aFrame, SCH_SCREEN* aScreen, SCH_C
         return false;
     };
 
-    std::vector<VECTOR2I> path;
+    auto pathIsClear = [&]( const std::vector<VECTOR2I>& aPath )
+    {
+        for( size_t i = 0; i + 1 < aPath.size(); i++ )
+        {
+            if( blocked( obstacles, aPath[i], aPath[i + 1] ) )
+                return false;
+        }
+
+        return true;
+    };
+
+    // Routes to try, in order of how tidy they look. The FIRST clear one wins.
+    //
+    // The straight run has to be checked like any other. Skipping it because the
+    // pins happen to line up was a real short: parts are auto-placed along one
+    // row, so pins share a y, so the direct wire between any two of them runs
+    // through every pin in between. A ground wire crossing a +5V pin ties the
+    // supply to ground, and the drawing looks perfectly ordinary.
+    std::vector<std::vector<VECTOR2I>> routes;
 
     if( a.x == b.x || a.y == b.y )
+        routes.push_back( { a, b } );
+
+    routes.push_back( { a, VECTOR2I( b.x, a.y ), b } );   // horizontal first
+    routes.push_back( { a, VECTOR2I( a.x, b.y ), b } );   // vertical first
+
+    // Detours, for when the direct routes are all blocked -- which is the normal
+    // case on a row of parts, not an exotic one. Step out of the row, run
+    // across, and come back in. Both directions, widening, so a wire can always
+    // find its way around unless the sheet is genuinely packed.
+    for( int steps = 2; steps <= 8; steps += 2 )
     {
-        path = { a, b };
+        const int offset = schIUScale.mmToIU( 1.27 * steps );
+
+        for( int sign : { -1, 1 } )
+        {
+            const int y = a.y + sign * offset;
+            routes.push_back( { a, VECTOR2I( a.x, y ), VECTOR2I( b.x, y ), b } );
+
+            const int x = a.x + sign * offset;
+            routes.push_back( { a, VECTOR2I( x, a.y ), VECTOR2I( x, b.y ), b } );
+        }
     }
-    else
+
+    std::vector<VECTOR2I> path;
+
+    for( const std::vector<VECTOR2I>& route : routes )
     {
-        // Two ways to turn one corner. Prefer one that crosses nothing; if both
-        // do, take the horizontal-first route and let the engineer move it.
-        const VECTOR2I cornerH( b.x, a.y );
-        const VECTOR2I cornerV( a.x, b.y );
-
-        const bool hClear = !blocked( obstacles, a, cornerH ) && !blocked( obstacles, cornerH, b );
-        const bool vClear = !blocked( obstacles, a, cornerV ) && !blocked( obstacles, cornerV, b );
-
-        if( hClear )
-            path = { a, cornerH, b };
-        else if( vClear )
-            path = { a, cornerV, b };
-        else
-            return false;   // see below
+        if( pathIsClear( route ) )
+        {
+            path = route;
+            break;
+        }
     }
 
-    // Refusing to draw is the right answer when neither route is clean. The two
-    // pins are already on the same net by name, so nothing is lost electrically;
-    // drawing a wire through a third part's pin would instead ADD a connection
-    // nobody asked for. An undrawn wire is a gap in a picture. A wrong one is a
-    // short.
+    // Refusing to draw is the right answer when nothing is clean. The two pins
+    // are already on the same net by name, so nothing is lost electrically;
+    // drawing through a third part's pin would instead ADD a connection nobody
+    // asked for. An undrawn wire is a gap in a picture. A wrong one is a short.
+    if( path.empty() )
+        return false;
 
 
     for( size_t i = 0; i + 1 < path.size(); i++ )
@@ -4300,6 +4332,55 @@ static wxString handleCheck( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
             entry["message"] = "overlaps "
                     + std::string( symbols[j]->GetRef( &currentSheet, true ).ToUTF8() );
             warnings.push_back( entry );
+        }
+    }
+
+    // ── Pins caught mid-wire ──
+    //
+    // The most dangerous thing that can happen to a schematic, and the quietest.
+    // A wire passing OVER a pin connects it, so a ground wire routed across a
+    // +5V symbol ties the supply to ground -- and the drawing looks completely
+    // ordinary. KiCad's own rule check grades this a warning, because a net
+    // name conflict is usually a naming mistake rather than a short. Here it is
+    // never that: every wire this tool draws ends on the two pins it is joining,
+    // so a pin found in the MIDDLE of one is always an accident.
+    //
+    // Deterministic, and independent of how ERC happens to be configured.
+    for( SCH_SYMBOL* sym : symbols )
+    {
+        for( SCH_PIN* pin : sym->GetPins( &currentSheet ) )
+        {
+            const VECTOR2I pinPos = pin->GetPosition();
+
+            for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+            {
+                SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+                if( line->GetLayer() != LAYER_WIRE )
+                    continue;
+
+                const VECTOR2I start = line->GetStartPoint();
+                const VECTOR2I end = line->GetEndPoint();
+
+                if( pinPos == start || pinPos == end )
+                    continue;   // an endpoint is the whole point
+
+                if( !line->HitTest( pinPos, 0 ) )
+                    continue;
+
+                json entry;
+                entry["kind"] = "short";
+                entry["ref"] = std::string( sym->GetRef( &currentSheet, true ).ToUTF8() );
+                entry["pin"] = std::string( pin->GetNumber().ToUTF8() );
+                entry["message"] =
+                        "This pin sits in the middle of a wire, so it has joined that "
+                        "wire's net whether or not it was meant to. If the two are "
+                        "different nets this is a short. Move the part clear of the "
+                        "wire, or delete the wire and re-issue connect_net for its net.";
+
+                problems.push_back( entry );
+                break;
+            }
         }
     }
 
