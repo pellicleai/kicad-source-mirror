@@ -34,6 +34,7 @@
 #include <wx/dcmemory.h>
 #include <wx/dir.h>
 #include <wx/filename.h>
+#include <wx/arrstr.h>
 #include <common.h>
 #include <map>
 #include <set>
@@ -176,6 +177,217 @@ struct PIN_MARKER
     SCH_ITEM* item;
     SCH_PIN*  pin;
 };
+
+
+// A searchable index of every symbol in every library.
+//
+// find_part used to match on symbol NAME alone, because loading each symbol to
+// read its description meant ~23,000 separate file reads per call and blew the
+// tool timeout. But a resistor's symbol is called "R", so searching "resistor"
+// matched nothing, and the only queries that worked were exact KiCad ids the
+// caller had to already know -- which is the guessing this tool exists to
+// prevent.
+//
+// GetSymbols() reads a whole library in one go rather than one symbol at a
+// time, so the index costs a couple of hundred library loads once, and nothing
+// on every call after that. It is rebuilt when the adapter's modify hash
+// changes, so adding a library mid-session is picked up.
+struct SYMBOL_INDEX_ENTRY
+{
+    wxString libId;
+    wxString libNickname;
+    wxString symName;
+    wxString lowerName;
+    wxString lowerDesc;
+    wxString lowerKeywords;
+    wxString haystack;      // all of the above, lowercased, for term matching
+};
+
+
+static const std::vector<SYMBOL_INDEX_ENTRY>& symbolIndex( SYMBOL_LIBRARY_ADAPTER* aAdapter )
+{
+    static std::vector<SYMBOL_INDEX_ENTRY> index;
+    static int                             builtForHash = -1;
+
+    const int hash = aAdapter->GetModifyHash();
+
+    if( !index.empty() && hash == builtForHash )
+        return index;
+
+    index.clear();
+
+    for( const wxString& libNickname : aAdapter->GetLibraryNames() )
+    {
+        std::vector<LIB_SYMBOL*> symbols;
+
+        try
+        {
+            symbols = aAdapter->GetSymbols( libNickname );
+        }
+        catch( ... )
+        {
+            // One unreadable library must not cost us every other one.
+            continue;
+        }
+
+        for( LIB_SYMBOL* symbol : symbols )
+        {
+            if( !symbol )
+                continue;
+
+            SYMBOL_INDEX_ENTRY entry;
+            entry.symName = symbol->GetName();
+            entry.libNickname = libNickname;
+            entry.libId = libNickname + wxS( ":" ) + entry.symName;
+
+            entry.lowerName = entry.symName;
+            entry.lowerName.LowerCase();
+
+            entry.lowerDesc = symbol->GetDescription();
+            entry.lowerDesc.LowerCase();
+
+            entry.lowerKeywords = symbol->GetKeyWords();
+            entry.lowerKeywords.LowerCase();
+
+            wxString lowerLib = libNickname;
+            lowerLib.LowerCase();
+
+            entry.haystack = entry.lowerName + wxS( " " ) + entry.lowerDesc + wxS( " " )
+                             + entry.lowerKeywords + wxS( " " ) + lowerLib;
+
+            index.push_back( std::move( entry ) );
+        }
+    }
+
+    builtForHash = hash;
+    return index;
+}
+
+
+// Does a wire already end at this point?
+//
+// Used to keep connect_net from stacking a second wire on a net that is already
+// drawn when it is called again -- which happens routinely, since adding one
+// more pin to an existing net means re-issuing the whole net.
+static bool hasWireAt( SCH_SCREEN* aScreen, const VECTOR2I& aPos )
+{
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_LINE_T ) )
+    {
+        SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+        if( line->GetLayer() != LAYER_WIRE )
+            continue;
+
+        if( line->GetStartPoint() == aPos || line->GetEndPoint() == aPos )
+            return true;
+    }
+
+    return false;
+}
+
+
+// Draw a wire between two pins.
+//
+// connect_net began as labels only, because wires were where the old code got
+// things wrong: KiCad merges collinear wires, and a pin that ends up in the
+// MIDDLE of a merged run silently leaves the net while the schematic still
+// looks right. Labels have no geometry, so they cannot fail that way.
+//
+// But a schematic is a drawing. A sheet whose connections exist only as matching
+// label text is electrically correct and unreadable -- the engineer sees parts
+// scattered in a row with no lines between them and reasonably concludes nothing
+// is connected. "It says connected, where?" is the correct response to it.
+//
+// So both. The wire is what a person reads; the label is what guarantees the
+// net. If the wire is wrong or cannot be drawn at all, the pins are still on the
+// net, which is the property worth keeping.
+//
+// Routing is deliberately simple: straight if the pins line up, otherwise an
+// L through whichever corner does not cross another part's body. Nothing
+// cleverer is warranted, because nothing here has to be optimal -- only legible
+// and out of the way.
+static bool routeWireBetween( SCH_EDIT_FRAME* aFrame, SCH_SCREEN* aScreen, SCH_COMMIT& aCommit,
+                              SCH_PIN* aFrom, SCH_PIN* aTo )
+{
+    const VECTOR2I a = aFrom->GetPosition();
+    const VECTOR2I b = aTo->GetPosition();
+
+    if( a == b )
+        return false;
+
+    const SYMBOL* ownerA = aFrom->GetParentSymbol();
+    const SYMBOL* ownerB = aTo->GetParentSymbol();
+
+    // Bodies a wire must not be drawn through. The two parts being connected are
+    // excluded: the wire starts and ends on their own pins.
+    std::vector<BOX2I> obstacles;
+
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        if( symbol == ownerA || symbol == ownerB )
+            continue;
+
+        obstacles.push_back( symbol->GetBodyBoundingBox() );
+    }
+
+    auto blocked = []( const std::vector<BOX2I>& aObstacles, const VECTOR2I& aStart,
+                       const VECTOR2I& aEnd )
+    {
+        // Both segments are axis-aligned, so their bounding box IS the segment
+        // and this test is exact rather than conservative.
+        BOX2I seg( aStart );
+        seg.Merge( aEnd );
+
+        for( const BOX2I& obstacle : aObstacles )
+        {
+            if( obstacle.Intersects( seg ) )
+                return true;
+        }
+
+        return false;
+    };
+
+    std::vector<VECTOR2I> path;
+
+    if( a.x == b.x || a.y == b.y )
+    {
+        path = { a, b };
+    }
+    else
+    {
+        // Two ways to turn one corner. Prefer one that crosses nothing; if both
+        // do, take the horizontal-first route and let the engineer move it.
+        const VECTOR2I cornerH( b.x, a.y );
+        const VECTOR2I cornerV( a.x, b.y );
+
+        const bool hClear = !blocked( obstacles, a, cornerH ) && !blocked( obstacles, cornerH, b );
+        const bool vClear = !blocked( obstacles, a, cornerV ) && !blocked( obstacles, cornerV, b );
+
+        if( hClear )
+            path = { a, cornerH, b };
+        else if( vClear )
+            path = { a, cornerV, b };
+        else
+            path = { a, cornerH, b };
+    }
+
+    for( size_t i = 0; i + 1 < path.size(); i++ )
+    {
+        if( path[i] == path[i + 1] )
+            continue;
+
+        SCH_LINE* wire = new SCH_LINE( path[i], LAYER_WIRE );
+        wire->SetEndPoint( path[i + 1] );
+
+        aFrame->AddToScreen( wire, aScreen );
+        aCommit.Added( wire, aScreen );
+        aFrame->GetCanvas()->GetView()->Update( wire );
+    }
+
+    return true;
+}
 
 
 // Is there anything at this point for a label to attach to?
@@ -1181,6 +1393,10 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
     // unambiguously litter -- it names this net but contributes nothing to it.
     int sweptStrays = 0;
 
+    // The pins actually placed on this net, in the order given, so the wire can
+    // be drawn through them once every one is known.
+    std::vector<SCH_PIN*> netPins;
+
     {
         std::vector<SCH_ITEM*> strays;
         const KICAD_T labelTypes[] = { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T };
@@ -1336,6 +1552,7 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
         if( alreadyLabelled )
         {
             connectedPins.push_back( std::string( ( refStr + wxS( "." ) + pinStr ).ToUTF8() ) );
+            netPins.push_back( pin );
             connected++;
             continue;
         }
@@ -1361,7 +1578,31 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
             lwbTool->BreakSegments( &commit, pinPos, screen );
 
         connectedPins.push_back( std::string( ( refStr + wxS( "." ) + pinStr ).ToUTF8() ) );
+        netPins.push_back( pin );
         connected++;
+    }
+
+    // Draw the net, now that every pin on it is known.
+    //
+    // Chained pin to pin: for the two-pin nets that make up most of a small
+    // circuit this is the obvious single wire, and for a longer net it is a
+    // readable daisy chain rather than a star nobody asked for.
+    //
+    // A wire is drawn only where neither end already has one, so calling
+    // connect_net again on a net that is already drawn does not stack duplicate
+    // wires on top of each other.
+    int wiresDrawn = 0;
+
+    for( size_t i = 0; i + 1 < netPins.size(); i++ )
+    {
+        SCH_PIN* from = netPins[i];
+        SCH_PIN* to = netPins[i + 1];
+
+        if( hasWireAt( screen, from->GetPosition() ) && hasWireAt( screen, to->GetPosition() ) )
+            continue;
+
+        if( routeWireBetween( frame, screen, commit, from, to ) )
+            wiresDrawn++;
     }
 
     // One commit for the whole net, so undo_last(1) removes the entire net
@@ -1389,6 +1630,9 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
 
     if( !errors.empty() )
         result["errors"] = errors;
+
+    if( wiresDrawn > 0 )
+        result["wires_drawn"] = wiresDrawn;
 
     if( sweptStrays > 0 )
     {
@@ -3623,31 +3867,46 @@ static wxString handleFindPart( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
         wxString query = rawQuery;
         query.LowerCase();
 
-        // Name and library matching only — no symbol is loaded from disk here.
-        // Loading every symbol to search descriptions meant ~23,000 file reads
-        // per call, which blew the tool timeout and killed runs before they ever
-        // reached wiring.
-        for( const wxString& libNickname : adapter->GetLibraryNames() )
+        // Split the query into words and require all of them, so "NPN transistor"
+        // and "transistor NPN" behave the same and neither has to appear as a
+        // literal phrase anywhere.
+        wxArrayString terms;
+
+        for( const wxString& term : wxSplit( query, ' ' ) )
         {
-            wxString lowerLib = libNickname;
-            lowerLib.LowerCase();
+            if( !term.IsEmpty() )
+                terms.Add( term );
+        }
 
-            for( const wxString& symName : adapter->GetSymbolNames( libNickname ) )
+        for( const SYMBOL_INDEX_ENTRY& entry : symbolIndex( adapter ) )
+        {
+            bool matchesAll = true;
+
+            for( const wxString& term : terms )
             {
-                wxString lowerSym = symName;
-                lowerSym.LowerCase();
-
-                int relevance = -1;
-
-                if( lowerSym == query )                 relevance = 0;
-                else if( lowerSym.StartsWith( query ) ) relevance = 1;
-                else if( lowerSym.Contains( query ) )   relevance = 2;
-                else if( lowerLib.Contains( query ) )   relevance = 3;
-                else                                    continue;
-
-                candidates.push_back( { libNickname + wxS( ":" ) + symName,
-                                        libNickname, symName, relevance } );
+                if( !entry.haystack.Contains( term ) )
+                {
+                    matchesAll = false;
+                    break;
+                }
             }
+
+            if( !matchesAll )
+                continue;
+
+            // Rank by WHERE the query was found. A symbol actually called
+            // "LED" beats one whose description merely mentions LEDs.
+            int relevance;
+
+            if( entry.lowerName == query )                  relevance = 0;
+            else if( entry.lowerName.StartsWith( query ) )  relevance = 1;
+            else if( entry.lowerName.Contains( query ) )    relevance = 2;
+            else if( entry.lowerDesc.Contains( query ) )    relevance = 3;
+            else if( entry.lowerKeywords.Contains( query ) ) relevance = 4;
+            else                                            relevance = 5;
+
+            candidates.push_back( { entry.libId, entry.libNickname, entry.symName,
+                                    relevance } );
         }
 
         std::stable_sort( candidates.begin(), candidates.end(),
@@ -3661,8 +3920,11 @@ static wxString handleFindPart( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
         none["status"] = "ok";
         none["count"] = 0;
         none["parts"] = json::array();
-        none["note"] = "Nothing matched. Search for the COMPONENT rather than the "
-                       "circuit — a divider is two resistors, so search \"resistor\".";
+        none["note"] = "Nothing matched. Every word in the query has to appear in a "
+                       "symbol's name, description or keywords, so a long phrase "
+                       "finds less than a short one — try the bare component name. "
+                       "If you searched for an arrangement of parts rather than a "
+                       "part, search for one of the components it is built from.";
         return wxString::FromUTF8( none.dump().c_str() );
     }
 
@@ -3885,6 +4147,13 @@ static wxString handleCheck( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
 
     for( SCH_SYMBOL* sym : symbols )
     {
+        // A power symbol is notation, not hardware: it has no footprint by
+        // design and never appears on a bill of materials. Reporting one as a
+        // problem made every clean schematic come back with two, and the caller
+        // had to write a paragraph explaining that the errors were not errors.
+        if( sym->IsPower() )
+            continue;
+
         wxString ref = sym->GetRef( &currentSheet, true );
         wxString fp = sym->GetFootprintFieldText( true, &currentSheet, false );
 
