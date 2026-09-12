@@ -288,6 +288,40 @@ static bool hasWireAt( SCH_SCREEN* aScreen, const VECTOR2I& aPos )
 }
 
 
+// Is this end of a wire attached to anything?
+//
+// A pin, or any OTHER wire. Used to find segments floating free after an edit
+// moved the thing they were drawn to -- the debris ERC reports as "wires not
+// connected to anything", which until now nothing was able to remove.
+static bool endpointIsLive( SCH_SCREEN* aScreen, SCH_SHEET_PATH& aSheet, SCH_LINE* aSelf,
+                            const VECTOR2I& aPos )
+{
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        for( SCH_PIN* pin : symbol->GetPins( &aSheet ) )
+        {
+            if( pin->GetPosition() == aPos )
+                return true;
+        }
+    }
+
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_LINE_T ) )
+    {
+        SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+        if( line == aSelf || line->GetLayer() != LAYER_WIRE )
+            continue;
+
+        if( line->GetStartPoint() == aPos || line->GetEndPoint() == aPos )
+            return true;
+    }
+
+    return false;
+}
+
+
 // Draw a wire between two pins.
 //
 // connect_net began as labels only, because wires were where the old code got
@@ -1707,16 +1741,71 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
     // connect_net again on a net that is already drawn does not stack duplicate
     // wires on top of each other.
     int wiresDrawn = 0;
+    int wiresCleared = 0;
+
+    // Re-issuing a net redraws it from scratch.
+    //
+    // Skipping pins that already had a wire was wrong in a way that only showed
+    // up once parts started moving. A wire drawn to a pin, whose part is then
+    // deleted, re-added or connected somewhere else, is left pointing at where
+    // that pin USED to be -- and nothing could remove it. ERC called it "wires
+    // not connected to anything", the agent could see it, name its exact
+    // coordinates, and had no tool able to delete a wire. It asked the engineer
+    // to do it by hand, and asked again, and again.
+    //
+    // Clearing first makes connect_net idempotent: call it with the pins you
+    // want and you get exactly those wires, however many times you call it and
+    // whatever happened in between. That is a better property than avoiding a
+    // little redundant drawing, and it removes the need for a delete-wire tool
+    // whose only purpose would be cleaning up after this one.
+    {
+        std::set<SCH_ITEM*> doomed;
+
+        for( SCH_PIN* pin : netPins )
+        {
+            const VECTOR2I pinPos = pin->GetPosition();
+
+            for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+            {
+                SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+                if( line->GetLayer() != LAYER_WIRE )
+                    continue;
+
+                if( line->GetStartPoint() == pinPos || line->GetEndPoint() == pinPos )
+                    doomed.insert( item );
+            }
+        }
+
+        // And anything already floating free. A wire with NEITHER end on a pin
+        // or another wire cannot be part of any net; it is debris from an edit
+        // that moved on without it, and it is what ERC is complaining about.
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_LINE_T ) )
+        {
+            SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+            if( line->GetLayer() != LAYER_WIRE || doomed.count( item ) )
+                continue;
+
+            if( !endpointIsLive( screen, currentSheet, line, line->GetStartPoint() )
+                && !endpointIsLive( screen, currentSheet, line, line->GetEndPoint() ) )
+            {
+                doomed.insert( item );
+            }
+        }
+
+        for( SCH_ITEM* item : doomed )
+        {
+            frame->RemoveFromScreen( item, screen );
+            commit.Removed( item, screen );
+            frame->GetCanvas()->GetView()->Remove( item );
+            wiresCleared++;
+        }
+    }
 
     for( size_t i = 0; i + 1 < netPins.size(); i++ )
     {
-        SCH_PIN* from = netPins[i];
-        SCH_PIN* to = netPins[i + 1];
-
-        if( hasWireAt( screen, from->GetPosition() ) && hasWireAt( screen, to->GetPosition() ) )
-            continue;
-
-        if( routeWireBetween( frame, screen, commit, from, to ) )
+        if( routeWireBetween( frame, screen, commit, netPins[i], netPins[i + 1] ) )
             wiresDrawn++;
     }
 
@@ -1748,6 +1837,15 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
 
     if( wiresDrawn > 0 )
         result["wires_drawn"] = wiresDrawn;
+
+    if( wiresCleared > 0 )
+    {
+        result["wires_cleared"] = wiresCleared;
+        result["wire_note"] = "Old and dangling wires were removed before this net was "
+                              "redrawn. Re-issuing connect_net always rebuilds a net's "
+                              "wiring from scratch, so it is the way to clean up after "
+                              "moving or replacing a part.";
+    }
 
     if( sweptStrays > 0 )
     {
@@ -4219,6 +4317,33 @@ static wxString handleCheck( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
 
                 if( marker.contains( "pin_name" ) )
                     entry["pin_name"] = marker["pin_name"];
+            }
+
+            // Translate the one ERC error that is not a mistake.
+            //
+            // A power symbol's pin is a power INPUT, and KiCad insists every
+            // power input is driven by a power OUTPUT somewhere. On a sheet with
+            // no regulator or battery -- which is most sheets early on, and any
+            // sheet fed from a connector -- nothing drives it, so a perfectly
+            // correct schematic fails ERC.
+            //
+            // PWR_FLAG is KiCad's answer: a symbol whose only job is to tell ERC
+            // "this net is driven from outside". Stating that plainly turns a
+            // baffling error into one instruction, which matters because the
+            // message as written gives no hint that a SYMBOL is the fix.
+            const std::string text = entry["message"].get<std::string>();
+
+            if( text.find( "not driven by any Output Power pins" ) != std::string::npos )
+            {
+                entry["kind"] = "power_not_driven";
+                entry["message"] =
+                        "This power pin is not driven by anything, which is what KiCad "
+                        "says whenever a supply comes from off the board. It is not a "
+                        "wiring mistake. Place power:PWR_FLAG with add_symbol and put it "
+                        "on this net with connect_net -- one flag per supply net, "
+                        "typically one for the positive rail and one for ground. "
+                        "PWR_FLAG is notation, has no footprint, and appears on no bill "
+                        "of materials.";
             }
 
             if( marker.value( "severity", "" ) == "error" )
