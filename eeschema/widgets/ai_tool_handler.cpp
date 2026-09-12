@@ -158,6 +158,91 @@ static SCH_EDIT_FRAME* getSchEditFrame( wxWindow* aWindow )
 }
 
 
+// A net label or a no-connect marks a PIN, but KiCad stores it as a coordinate
+// and nothing ties the two together. So when a symbol moves or is deleted, the
+// marker stays exactly where it was.
+//
+// That is not cosmetic. The pin it used to mark silently leaves its net, and the
+// marker becomes an orphan sitting over empty space, which ERC reports as
+// "Label not connected". A sheet can end up carrying twice as many labels as
+// pins, half of them meaningless, while every tool involved reported success --
+// which is precisely what happened: three parts, six pins, twelve labels.
+//
+// So markers are collected together WITH the pin they belong to before the
+// symbol is touched, and afterwards either moved to wherever that pin ended up
+// or removed along with it.
+struct PIN_MARKER
+{
+    SCH_ITEM* item;
+    SCH_PIN*  pin;
+};
+
+
+// Is there anything at this point for a label to attach to?
+//
+// A label is only meaningful where a pin or a wire is. Sitting anywhere else it
+// names nothing, contributes nothing to the netlist, and shows up in ERC as
+// "Label not connected" -- a warning that reads like a wiring mistake but is
+// really just litter.
+static bool hasConnectableAt( SCH_SCREEN* aScreen, SCH_SHEET_PATH& aSheet, const VECTOR2I& aPos )
+{
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_SYMBOL_T ) )
+    {
+        SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+        for( SCH_PIN* pin : symbol->GetPins( &aSheet ) )
+        {
+            if( pin->GetPosition() == aPos )
+                return true;
+        }
+    }
+
+    // A wire counts anywhere along it, not only at its ends: KiCad breaks a
+    // segment at a label placed mid-run.
+    for( SCH_ITEM* item : aScreen->Items().OfType( SCH_LINE_T ) )
+    {
+        SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+        if( line->GetLayer() != LAYER_WIRE )
+            continue;
+
+        if( line->GetStartPoint() == aPos || line->GetEndPoint() == aPos
+            || line->HitTest( aPos, 0 ) )
+            return true;
+    }
+
+    return false;
+}
+
+
+static std::vector<PIN_MARKER> collectPinMarkers( SCH_SCREEN* aScreen, SCH_SYMBOL* aSymbol,
+                                                  SCH_SHEET_PATH& aSheet )
+{
+    std::vector<PIN_MARKER> found;
+
+    const KICAD_T markerTypes[] = { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T,
+                                    SCH_NO_CONNECT_T };
+
+    for( SCH_PIN* pin : aSymbol->GetPins( &aSheet ) )
+    {
+        VECTOR2I pinPos = pin->GetPosition();
+
+        for( KICAD_T type : markerTypes )
+        {
+            for( SCH_ITEM* item : aScreen->Items().OfType( type ) )
+            {
+                if( item->GetPosition() == pinPos )
+                    found.push_back( { item, pin } );
+            }
+        }
+    }
+
+    return found;
+}
+
+
+
+
 // ---------------------------------------------------------------------------
 // Tool: add_symbol
 //
@@ -1088,6 +1173,41 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
     json connectedPins = json::array();
     json clearedNoConnects = json::array();
 
+    // Sweep away labels carrying THIS net's name that are attached to nothing.
+    //
+    // Scoped to the net being built on purpose: a stray label of some other name
+    // may be work in progress on a net nobody has finished yet, and deleting it
+    // would be a surprise. One carrying the name we are about to place is
+    // unambiguously litter -- it names this net but contributes nothing to it.
+    int sweptStrays = 0;
+
+    {
+        std::vector<SCH_ITEM*> strays;
+        const KICAD_T labelTypes[] = { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T };
+
+        for( KICAD_T type : labelTypes )
+        {
+            for( SCH_ITEM* item : screen->Items().OfType( type ) )
+            {
+                SCH_LABEL_BASE* label = static_cast<SCH_LABEL_BASE*>( item );
+
+                if( label->GetText() == netName
+                    && !hasConnectableAt( screen, currentSheet, label->GetPosition() ) )
+                {
+                    strays.push_back( item );
+                }
+            }
+        }
+
+        for( SCH_ITEM* stray : strays )
+        {
+            frame->RemoveFromScreen( stray, screen );
+            commit.Removed( stray, screen );
+            frame->GetCanvas()->GetView()->Remove( stray );
+            sweptStrays++;
+        }
+    }
+
     for( const auto& pinSpec : aArgs["pins"] )
     {
         wxString refStr;
@@ -1269,6 +1389,13 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
 
     if( !errors.empty() )
         result["errors"] = errors;
+
+    if( sweptStrays > 0 )
+    {
+        result["removed_stray_labels"] = sweptStrays;
+        result["stray_note"] = "Labels with this net's name were sitting on nothing and have "
+                               "been removed. They were left behind by an earlier edit.";
+    }
 
     if( !clearedNoConnects.empty() )
     {
@@ -2337,9 +2464,24 @@ static wxString handleMoveSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
     // snapshot, and pulls the item from the screen's spatial index so its
     // geometry can safely change.
     SCH_COMMIT commit( frame->GetToolManager() );
+
+    // Labels and no-connects are stored at pin coordinates, so moving only the
+    // symbol strands them and quietly drops its pins off their nets. Capture
+    // them first, move the part, then put each one back on the pin it marks.
+    std::vector<PIN_MARKER> markers = collectPinMarkers( screen, target, currentSheet );
+
+    for( const PIN_MARKER& marker : markers )
+        commit.Modify( marker.item, screen );
+
     commit.Modify( target, screen );
 
     target->SetPosition( newPos );
+
+    for( const PIN_MARKER& marker : markers )
+    {
+        marker.item->SetPosition( marker.pin->GetPosition() );
+        frame->GetCanvas()->GetView()->Update( marker.item );
+    }
 
     commit.Push( _( "Move Symbol (AI)" ) );
 
@@ -2424,10 +2566,24 @@ static wxString handleRotateSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArg
     // snapshot, and pulls the item from the screen's spatial index so its
     // geometry can safely change.
     SCH_COMMIT commit( frame->GetToolManager() );
+
+    // Rotating moves every pin, so the markers on them must move too. See
+    // collectPinMarkers.
+    std::vector<PIN_MARKER> markers = collectPinMarkers( screen, target, currentSheet );
+
+    for( const PIN_MARKER& marker : markers )
+        commit.Modify( marker.item, screen );
+
     commit.Modify( target, screen );
 
     for( int i = 0; i < steps; i++ )
         target->Rotate( center, true ); // true = counter-clockwise
+
+    for( const PIN_MARKER& marker : markers )
+    {
+        marker.item->SetPosition( marker.pin->GetPosition() );
+        frame->GetCanvas()->GetView()->Update( marker.item );
+    }
 
     commit.Push( _( "Rotate Symbol (AI)" ) );
 
@@ -3139,20 +3295,44 @@ static wxString handleDeleteSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArg
     if( !target )
         return wxString::Format( R"({ "error": "Symbol not found: %s" })", refToDelete );
 
-    // Remove from screen and create undoable commit
-    frame->RemoveFromScreen( target, screen );
+    // Everything sitting on this symbol's pins goes with it. Gather before
+    // removing, while the pins still have positions.
+    std::vector<PIN_MARKER> markers = collectPinMarkers( screen, target, currentSheet );
 
     SCH_COMMIT commit( frame->GetToolManager() );
+
+    json removedLabels = json::array();
+
+    for( const PIN_MARKER& marker : markers )
+    {
+        if( SCH_LABEL_BASE* label = dynamic_cast<SCH_LABEL_BASE*>( marker.item ) )
+            removedLabels.push_back( std::string( label->GetText().ToUTF8() ) );
+
+        frame->RemoveFromScreen( marker.item, screen );
+        commit.Removed( marker.item, screen );
+        frame->GetCanvas()->GetView()->Remove( marker.item );
+    }
+
+    frame->RemoveFromScreen( target, screen );
     commit.Removed( target, screen );
+
+    // One commit for the part and its markers, so a single undo_last brings the
+    // whole thing back rather than resurrecting the symbol without its nets.
     commit.Push( _( "Delete Symbol (AI)" ) );
 
-    // Refresh canvas
     frame->GetCanvas()->GetView()->Remove( target );
     frame->GetCanvas()->Refresh();
 
     json result;
     result["status"] = "ok";
     result["deleted"] = std::string( refToDelete.ToUTF8() );
+
+    if( !removedLabels.empty() )
+    {
+        result["removed_labels"] = removedLabels;
+        result["note"] = "The net labels on this part's pins were removed with it. Any net "
+                         "that relied on them is now shorter -- re-check it.";
+    }
 
     return wxString::FromUTF8( result.dump().c_str() );
 }
@@ -3785,6 +3965,33 @@ static wxString handleCheck( AI_ASSISTANT_PANEL* aPanel, const json& aArgs )
             entry["message"] = "overlaps "
                     + std::string( symbols[j]->GetRef( &currentSheet, true ).ToUTF8() );
             warnings.push_back( entry );
+        }
+    }
+
+    // ── Stray labels ──
+    // A label attached to nothing names no net. ERC reports it as "Label not
+    // connected", which reads like a wiring fault and sends the reader hunting
+    // for a break that is not there.
+    for( KICAD_T type : { SCH_LABEL_T, SCH_GLOBAL_LABEL_T, SCH_HIER_LABEL_T } )
+    {
+        for( SCH_ITEM* item : screen->Items().OfType( type ) )
+        {
+            SCH_LABEL_BASE* label = static_cast<SCH_LABEL_BASE*>( item );
+
+            if( hasConnectableAt( screen, currentSheet, label->GetPosition() ) )
+                continue;
+
+            json entry;
+            entry["type"] = "stray_label";
+            entry["net"] = std::string( label->GetText().ToUTF8() );
+            entry["at"]["x"] = schIUScale.IUTomm( label->GetPosition().x );
+            entry["at"]["y"] = schIUScale.IUTomm( label->GetPosition().y );
+            entry["message"] = wxString::Format(
+                    "Label \"%s\" sits on no pin and no wire, so it is not part of any net. "
+                    "Re-issue connect_net for \"%s\" and it will be cleared.",
+                    label->GetText(), label->GetText() ).ToStdString();
+
+            problems.push_back( entry );
         }
     }
 
