@@ -176,6 +176,8 @@ struct PIN_MARKER
 {
     SCH_ITEM* item;
     SCH_PIN*  pin;
+    bool      wireStart;   // this item is a wire whose START is on the pin
+    bool      wireEnd;     // ... or whose END is
 };
 
 
@@ -330,6 +332,13 @@ static bool routeWireBetween( SCH_EDIT_FRAME* aFrame, SCH_SCREEN* aScreen, SCH_C
             continue;
 
         obstacles.push_back( symbol->GetBodyBoundingBox() );
+
+        // Pins are obstacles in their own right, and the dangerous kind. A wire
+        // crossing a part's BODY is ugly; a wire crossing a part's PIN joins
+        // that pin to this net, silently and invisibly. A power symbol's pin
+        // caught under a passing ground wire is a short nothing reports.
+        for( SCH_PIN* pin : symbol->GetPins() )
+            obstacles.push_back( BOX2I( pin->GetPosition() ) );
     }
 
     auto blocked = []( const std::vector<BOX2I>& aObstacles, const VECTOR2I& aStart,
@@ -370,8 +379,15 @@ static bool routeWireBetween( SCH_EDIT_FRAME* aFrame, SCH_SCREEN* aScreen, SCH_C
         else if( vClear )
             path = { a, cornerV, b };
         else
-            path = { a, cornerH, b };
+            return false;   // see below
     }
+
+    // Refusing to draw is the right answer when neither route is clean. The two
+    // pins are already on the same net by name, so nothing is lost electrically;
+    // drawing a wire through a third part's pin would instead ADD a connection
+    // nobody asked for. An undrawn wire is a gap in a picture. A wrong one is a
+    // short.
+
 
     for( size_t i = 0; i + 1 < path.size(); i++ )
     {
@@ -387,6 +403,30 @@ static bool routeWireBetween( SCH_EDIT_FRAME* aFrame, SCH_SCREEN* aScreen, SCH_C
     }
 
     return true;
+}
+
+
+// Put one marker back on the pin it belongs to, after that pin has moved.
+//
+// A label is a point and simply follows. A wire is a segment with one end on the
+// pin and the other somewhere else, so only that end moves -- setting a wire's
+// "position" would drag the whole segment and disconnect its far end instead.
+static void movePinMarker( const PIN_MARKER& aMarker )
+{
+    const VECTOR2I pinPos = aMarker.pin->GetPosition();
+
+    if( SCH_LINE* line = dynamic_cast<SCH_LINE*>( aMarker.item ) )
+    {
+        if( aMarker.wireStart )
+            line->SetStartPoint( pinPos );
+
+        if( aMarker.wireEnd )
+            line->SetEndPoint( pinPos );
+
+        return;
+    }
+
+    aMarker.item->SetPosition( pinPos );
 }
 
 
@@ -444,8 +484,28 @@ static std::vector<PIN_MARKER> collectPinMarkers( SCH_SCREEN* aScreen, SCH_SYMBO
             for( SCH_ITEM* item : aScreen->Items().OfType( type ) )
             {
                 if( item->GetPosition() == pinPos )
-                    found.push_back( { item, pin } );
+                    found.push_back( { item, pin, false, false } );
             }
+        }
+
+        // Wires have exactly the same problem as labels, and a worse
+        // consequence. A label left behind names nothing; a wire left behind is
+        // still a conductor, and the next part placed anywhere along it joins
+        // that net silently. A power symbol dropped onto a stale ground wire is
+        // a short that no tool reports, because every tool did its own job
+        // correctly.
+        for( SCH_ITEM* item : aScreen->Items().OfType( SCH_LINE_T ) )
+        {
+            SCH_LINE* line = static_cast<SCH_LINE*>( item );
+
+            if( line->GetLayer() != LAYER_WIRE )
+                continue;
+
+            const bool atStart = line->GetStartPoint() == pinPos;
+            const bool atEnd = line->GetEndPoint() == pinPos;
+
+            if( atStart || atEnd )
+                found.push_back( { item, pin, atStart, atEnd } );
         }
     }
 
@@ -2723,7 +2783,7 @@ static wxString handleMoveSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
 
     for( const PIN_MARKER& marker : markers )
     {
-        marker.item->SetPosition( marker.pin->GetPosition() );
+        movePinMarker( marker );
         frame->GetCanvas()->GetView()->Update( marker.item );
     }
 
@@ -2825,7 +2885,7 @@ static wxString handleRotateSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArg
 
     for( const PIN_MARKER& marker : markers )
     {
-        marker.item->SetPosition( marker.pin->GetPosition() );
+        movePinMarker( marker );
         frame->GetCanvas()->GetView()->Update( marker.item );
     }
 
@@ -3546,11 +3606,14 @@ static wxString handleDeleteSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArg
     SCH_COMMIT commit( frame->GetToolManager() );
 
     json removedLabels = json::array();
+    int  removedWires = 0;
 
     for( const PIN_MARKER& marker : markers )
     {
         if( SCH_LABEL_BASE* label = dynamic_cast<SCH_LABEL_BASE*>( marker.item ) )
             removedLabels.push_back( std::string( label->GetText().ToUTF8() ) );
+        else if( dynamic_cast<SCH_LINE*>( marker.item ) )
+            removedWires++;
 
         frame->RemoveFromScreen( marker.item, screen );
         commit.Removed( marker.item, screen );
@@ -3570,6 +3633,9 @@ static wxString handleDeleteSymbol( AI_ASSISTANT_PANEL* aPanel, const json& aArg
     json result;
     result["status"] = "ok";
     result["deleted"] = std::string( refToDelete.ToUTF8() );
+
+    if( removedWires > 0 )
+        result["removed_wires"] = removedWires;
 
     if( !removedLabels.empty() )
     {
