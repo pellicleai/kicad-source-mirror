@@ -1641,6 +1641,29 @@ static wxString handleConnectNet( AI_ASSISTANT_PANEL* aPanel, const json& aArgs 
             continue;
         }
 
+        // A power symbol already declares its net -- that is the entire purpose
+        // of the symbol. Labelling its pin with the name it is printing right
+        // there writes "+5V" on top of something that says "+5V", which reads
+        // like a mistake and is one more thing to keep in step.
+        //
+        // Unlike every other label this tool places, skipping it costs no safety:
+        // a power symbol cannot lose its own name the way an ordinary pin can
+        // lose a label.
+        if( !alreadyLabelled && pin->GetParentSymbol() && pin->GetParentSymbol()->IsPower() )
+        {
+            SCH_SYMBOL* owner = static_cast<SCH_SYMBOL*>( pin->GetParentSymbol() );
+            wxString    declared = owner->GetValue( true, &currentSheet, false );
+
+            if( declared == netName )
+            {
+                connectedPins.push_back(
+                        std::string( ( refStr + wxS( "." ) + pinStr ).ToUTF8() ) );
+                netPins.push_back( pin );
+                connected++;
+                continue;
+            }
+        }
+
         if( alreadyLabelled )
         {
             connectedPins.push_back( std::string( ( refStr + wxS( "." ) + pinStr ).ToUTF8() ) );
